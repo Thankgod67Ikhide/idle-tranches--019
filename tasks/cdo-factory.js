@@ -1,0 +1,2642 @@
+require("hardhat/config")
+const { BigNumber } = require("@ethersproject/bignumber");
+const helpers = require("../scripts/helpers");
+const addresses = require("../utils/addresses");
+const { getAdminAddress, getImplementationAddress } = require("@openzeppelin/upgrades-core");
+const { task } = require("hardhat/config");
+const HypernativeModuleAbi = require("../abi/HypernativeModule.json");
+
+const BN = n => BigNumber.from(n);
+const ONE_TOKEN = decimals => BigNumber.from('10').pow(BigNumber.from(decimals));
+const FULL_ALLOC = '100000';
+const MIN_CREDIT_VAULT_PERFORMANCE_FEE = '5000';
+const MIN_CREDIT_VAULT_MANAGEMENT_FEE = '500';
+const mainnetContracts = addresses.IdleTokens.mainnet;
+const polygonContracts = addresses.IdleTokens.polygon;
+const polygonZKContracts = addresses.IdleTokens.polygonZK;
+const optimismContracts = addresses.IdleTokens.optimism;
+const arbitrumContracts = addresses.IdleTokens.arbitrum;
+const baseContracts = addresses.IdleTokens.base;
+const avaxContracts = addresses.IdleTokens.avax;
+const mainnetCDOs = addresses.CDOs;
+const polygonCDOs = addresses.polygonCDOs;
+const polygonZKCDOs = addresses.polygonZKCDOs;
+const optimismCDOs = addresses.optimismCDOs;
+const arbitrumCDOs = addresses.arbitrumCDOs;
+const baseCDOs = addresses.baseCDOs;
+const avaxCDOs = addresses.avaxCDOs;
+const addr0 = '0x0000000000000000000000000000000000000000';
+
+const DEFAULT_HYPERNATIVE_TAG_LIST_ID = '4ad4b133-2c72-42d4-9f79-a74c9f3ba20a';
+const HYPERNATIVE_API_BASE_URL = 'https://api.hypernative.xyz';
+const HYPERNATIVE_CONTRACT_VALUE_TEMPLATE_AGENT_ID = '59712';
+const HYPERNATIVE_AA_VIRTUAL_PRICE_TEMPLATE_AGENT_ID = '59713';
+const HYPERNATIVE_GLOBAL_WATCHLISTS = [
+  { id: '12849', description: 'cross chain auto pause' },
+];
+const hypernativeChainConfigs = {
+  1: {
+    label: 'Ethereum',
+    chain: 'ethereum',
+    notePrefix: '[ETH] credit ',
+    tagListId: DEFAULT_HYPERNATIVE_TAG_LIST_ID,
+    watchlists: [
+      { id: '658', description: 'eth watch' },
+      { id: '899', description: 'eth auto pause' },
+    ],
+  },
+  10: {
+    label: 'Optimism',
+    chain: 'optimism',
+    notePrefix: '[OPTIMISM] credit ',
+    tagListId: DEFAULT_HYPERNATIVE_TAG_LIST_ID,
+    watchlists: [
+      { id: '1170', description: 'optimism watch' },
+      { id: '12811', description: 'optimism auto pause' },
+    ],
+  },
+  137: {
+    label: 'Polygon',
+    chain: 'polygon',
+    notePrefix: '[POLYGON] credit ',
+    tagListId: DEFAULT_HYPERNATIVE_TAG_LIST_ID,
+    watchlists: [
+      { id: '14871', description: 'polygon watch' },
+      { id: '14872', description: 'polygon auto pause' },
+    ],
+  },
+  1101: {
+    label: 'Polygon ZK',
+    chain: 'polygon_zkevm',
+    notePrefix: '[POLYGON ZK] credit ',
+    tagListId: DEFAULT_HYPERNATIVE_TAG_LIST_ID,
+    watchlists: [
+      { id: '11511', description: 'zkevm watch' },
+    ],
+  },
+  42161: {
+    label: 'Arbitrum',
+    chain: 'arbitrum',
+    notePrefix: '[ARBITRUM] credit ',
+    tagListId: DEFAULT_HYPERNATIVE_TAG_LIST_ID,
+    watchlists: [
+      { id: '12786', description: 'arb watch' },
+      { id: '12822', description: 'arb auto pause' },
+    ],
+  },
+  8453: {
+    label: 'Base',
+    chain: 'base',
+    notePrefix: '[BASE] credit ',
+    tagListId: DEFAULT_HYPERNATIVE_TAG_LIST_ID,
+    watchlists: [
+      { id: '224749', description: 'base watch' },
+      { id: '224748', description: 'base auto pause' },
+    ],
+  },
+  43114: {
+    label: 'Avalanche',
+    chain: 'avax',
+    notePrefix: '[AVAX] credit ',
+    tagListId: DEFAULT_HYPERNATIVE_TAG_LIST_ID,
+    watchlists: [
+      { id: '226568', description: 'avax watch' },
+      { id: '226569', description: 'avax auto pause' },
+    ],
+  },
+};
+
+const hypernativeFetch = async ({ clientId, clientSecret, method = 'GET', path, body }) => {
+  const res = await fetch(`${HYPERNATIVE_API_BASE_URL}${path}`, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'accept': 'application/json',
+      'x-client-id': clientId,
+      'x-client-secret': clientSecret,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const responseBody = await res.text();
+  if (!res.ok) {
+    throw new Error(`${method} ${path}: ${res.status} ${res.statusText} ${responseBody}`);
+  }
+
+  const parsedBody = responseBody ? JSON.parse(responseBody) : {};
+  if (parsedBody.success === false) {
+    throw new Error(`${method} ${path}: ${parsedBody.error || 'Hypernative request failed'}`);
+  }
+  return parsedBody.data;
+};
+
+const buildHypernativeCustomAgentPayload = ({ agentName, cdoAddress, chainConfig, input, template, underlyingDecimals }) => {
+  const payload = JSON.parse(JSON.stringify(template));
+  ['id', 'createdAt', 'updatedAt', 'createdBy', 'createdByUserId', 'alertPolicies', 'alertsTagsStats', 'securitySuits', 'lastTriggered']
+    .forEach((field) => delete payload[field]);
+
+  const rule = payload.rule;
+  const contractAlias = `${cdoAddress.slice(0, 4).toLowerCase()}..${cdoAddress.slice(-4).toLowerCase()}`;
+  const previousInput = rule.input?.[0];
+  const previousAlias = rule.contractAddressAlias;
+  const previousOperand = rule.operands?.[0];
+
+  payload.agentName = agentName;
+  payload.channelsConfigurations = (template.alertPolicies || [])
+    .flatMap(({ channelsConfigurations }) => channelsConfigurations || [])
+    .map(({ id, name }) => ({ id, name }));
+  payload.remindersConfigurations = [];
+  payload.endAlertsConfigurations = [];
+  payload.securitySuitIds = [];
+
+  rule.chain = chainConfig?.chain || 'ethereum';
+  rule.contractAddress = cdoAddress.toLowerCase();
+  rule.contractAddressAlias = contractAlias;
+  rule.input = input;
+  rule.ruleString = (rule.ruleString || '')
+    .replace('On Ethereum', `On ${chainConfig?.label || 'Ethereum'}`)
+    .replace(previousAlias, contractAlias);
+  if (previousInput && input[0]) {
+    rule.ruleString = rule.ruleString.replace(previousInput, input[0]);
+  }
+  if (rule.funcSig === 'getContractValue()' && underlyingDecimals !== undefined) {
+    const tvlChangeThreshold = BN('10000').mul(ONE_TOKEN(underlyingDecimals)).toString();
+    rule.operands = [tvlChangeThreshold];
+    rule.operandsExponent = [underlyingDecimals];
+    rule.ruleString = rule.ruleString.replace(previousOperand, tvlChangeThreshold);
+    rule.customDescription = rule.customDescription.replace(/dev_decimals\(\d+\)/g, `dev_decimals(${underlyingDecimals})`);
+  }
+
+  return payload;
+};
+
+const getHypernativeChainConfig = (chainId) => hypernativeChainConfigs[chainId];
+const getRuntimeChainId = async (_hre) => {
+  const configuredChainId = Number(_hre.network.config.chainId);
+  if (!Number.isNaN(configuredChainId)) {
+    return configuredChainId;
+  }
+  const { chainId } = await _hre.ethers.provider.getNetwork();
+  return Number(chainId);
+};
+
+const getNetworkCDOs = (_hre) => {
+  const isMatic = _hre.network.name == 'matic' || _hre.network.config.chainId == 137;
+  const isPolygonZK = _hre.network.name == 'polygonzk' || _hre.network.config.chainId == 1101;
+  const isOptimism = _hre.network.name == 'optimism' || _hre.network.config.chainId == 10;
+  const isArbitrum = _hre.network.name == 'arbitrum' || _hre.network.config.chainId == 42161;
+  const isBase = _hre.network.name == 'base' || _hre.network.config.chainId == 8453;
+  const isAvax = _hre.network.name == 'avax' || _hre.network.config.chainId == 43114;
+  if (isMatic) {
+    return polygonCDOs;
+  } else if (isPolygonZK) {
+    return polygonZKCDOs;
+  } else if (isOptimism) {
+    return optimismCDOs;
+  } else if (isArbitrum) {
+    return arbitrumCDOs;
+  } else if (isBase) {
+    return baseCDOs;
+  } else if (isAvax) {
+    return avaxCDOs;
+  }
+  return mainnetCDOs;
+}
+
+const getNetworkContracts = (_hre) => {
+  const isMatic = _hre.network.name == 'matic' || _hre.network.config.chainId == 137;
+  const isPolygonZK = _hre.network.name == 'polygonzk' || _hre.network.config.chainId == 1101;
+  const isOptimism = _hre.network.name == 'optimism' || _hre.network.config.chainId == 10;
+  const isArbitrum = _hre.network.name == 'arbitrum' || _hre.network.config.chainId == 42161;
+  const isBase = _hre.network.name == 'base' || _hre.network.config.chainId == 8453;
+  const isAvax = _hre.network.name == 'avax' || _hre.network.config.chainId == 43114;
+  if (isMatic) {
+    return polygonContracts;
+  } else if (isPolygonZK) {
+    return polygonZKContracts;
+  } else if (isOptimism) {
+    return optimismContracts;
+  } else if (isArbitrum) {
+    return arbitrumContracts;
+  } else if (isBase) {
+    return baseContracts;
+  } else if (isAvax) {
+    return avaxContracts;
+  }
+  return mainnetContracts;
+}
+
+const getDeployTokens = (_hre) => {
+  const isMatic = _hre.network.name == 'matic' || _hre.network.config.chainId == 137;
+  const isPolygonZK = _hre.network.name == 'polygonzk' || _hre.network.config.chainId == 1101;
+  const isOptimism = _hre.network.name == 'optimism' || _hre.network.config.chainId == 10;
+  const isArbitrum = _hre.network.name == 'arbitrum' || _hre.network.config.chainId == 42161;
+  const isBase = _hre.network.name == 'base' || _hre.network.config.chainId == 8453;
+  const isAvax = _hre.network.name == 'avax' || _hre.network.config.chainId == 43114;
+  if (isMatic) {
+    return addresses.deployTokensPolygon;
+  } else if (isPolygonZK) {
+    return addresses.deployTokensPolygonZK;
+  } else if (isOptimism) {
+    return addresses.deployTokensOptimism;
+  } else if (isArbitrum) {
+    return addresses.deployTokensArbitrum;
+  } else if (isBase) {
+    return addresses.deployTokensBase;
+  } else if (isAvax) {
+    return addresses.deployTokensAvax;
+  }
+  return addresses.deployTokens;
+}
+
+const getProgrammableBorrowerConfig = (deployToken) => {
+  if (!deployToken.programmableBorrower || typeof deployToken.programmableBorrower !== "object") {
+    return null;
+  }
+
+  return deployToken.programmableBorrower;
+};
+
+const sameAddress = (left, right) => {
+  return left && right && left.toLowerCase() === right.toLowerCase();
+};
+const normalizeAddress = (address) => (address || '').toLowerCase();
+const hasAddress = (address) => !helpers.isEmptyString(address) && ethers.utils.isAddress(address.toString().trim()) && address.toString().trim().toLowerCase() !== addr0;
+const getCreditVaultFee = (deployToken) => deployToken.fees === undefined ? '0' : deployToken.fees;
+const getCreditVaultFactoryFee = (deployToken) => deployToken.fees === undefined ? MIN_CREDIT_VAULT_PERFORMANCE_FEE : deployToken.fees;
+const getCreditVaultFeeSplit = (deployToken) => deployToken.feeSplit === undefined ? FULL_ALLOC : deployToken.feeSplit;
+const getCreditVaultFeeReceiver = (deployToken, owner) => deployToken.feeReceiver || owner;
+const getCreditVaultManagementFee = (deployToken) => deployToken.managementFee === undefined ? '0' : deployToken.managementFee;
+const validateCreditVaultMinimumFees = (fees, managementFee) => {
+  if (BN(fees).lt(MIN_CREDIT_VAULT_PERFORMANCE_FEE) && BN(managementFee).lt(MIN_CREDIT_VAULT_MANAGEMENT_FEE)) {
+    throw new Error(
+      `Credit vault fees too low: performance fee must be at least ${MIN_CREDIT_VAULT_PERFORMANCE_FEE} or management fee at least ${MIN_CREDIT_VAULT_MANAGEMENT_FEE}`
+    );
+  }
+};
+const getTrackedCreditVault = (_hre, cdoAddress) => {
+  if (!cdoAddress) {
+    return null;
+  }
+  return Object.values(getNetworkCDOs(_hre)).find(
+    ({ cdoAddr }) => normalizeAddress(cdoAddr) === normalizeAddress(cdoAddress)
+  ) || null;
+}
+const getTrackedCreditVaultByName = (_hre, cdoName) => {
+  if (helpers.isEmptyString(cdoName)) {
+    return null;
+  }
+
+  const creditVaultName = cdoName.toString().trim().toLowerCase();
+  const trackedCdo = getNetworkCDOs(_hre)[creditVaultName];
+  if (!trackedCdo) {
+    throw new Error(`Unknown credit vault name ${creditVaultName}`);
+  }
+  return trackedCdo;
+}
+const getTrackedWriteOff = (trackedCdo) => trackedCdo?.writeOff || trackedCdo?.writeoff || null;
+const resolveHypernativeCreditVaultMetadata = (trackedCdo, aaTranche, underlyingDecimals) => {
+  const resolvedAaTranche = hasAddress(aaTranche)
+    ? aaTranche
+    : (hasAddress(trackedCdo?.AATranche) ? trackedCdo.AATranche : null);
+  const decimals = underlyingDecimals === undefined || underlyingDecimals === null || underlyingDecimals === ''
+    ? trackedCdo?.decimals
+    : underlyingDecimals;
+  const resolvedUnderlyingDecimals = decimals === undefined ? undefined : Number(decimals);
+  if (
+    resolvedUnderlyingDecimals !== undefined &&
+    (!Number.isInteger(resolvedUnderlyingDecimals) || resolvedUnderlyingDecimals < 0)
+  ) {
+    throw new Error(`Invalid underlying decimals ${decimals}`);
+  }
+  return { aaTranche: resolvedAaTranche, underlyingDecimals: resolvedUnderlyingDecimals };
+};
+const getNetworkContractsReferenceName = (_hre) => {
+  const isMatic = _hre.network.name == 'matic' || _hre.network.config.chainId == 137;
+  const isPolygonZK = _hre.network.name == 'polygonzk' || _hre.network.config.chainId == 1101;
+  const isOptimism = _hre.network.name == 'optimism' || _hre.network.config.chainId == 10;
+  const isArbitrum = _hre.network.name == 'arbitrum' || _hre.network.config.chainId == 42161;
+  const isBase = _hre.network.name == 'base' || _hre.network.config.chainId == 8453;
+  const isAvax = _hre.network.name == 'avax' || _hre.network.config.chainId == 43114;
+  if (isMatic) {
+    return 'polygonContracts';
+  } else if (isPolygonZK) {
+    return 'polygonZKContracts';
+  } else if (isOptimism) {
+    return 'optimismContracts';
+  } else if (isArbitrum) {
+    return 'arbitrumContracts';
+  } else if (isBase) {
+    return 'baseContracts';
+  } else if (isAvax) {
+    return 'avaxContracts';
+  }
+  return 'mainnetContracts';
+}
+const checksumAddress = (address) => ethers.utils.getAddress(address);
+const formatAddressValue = (address) => hasAddress(address) ? `'${checksumAddress(address)}'` : "''";
+const sanitizeCreditVaultEntryNamePart = (value) => value.toString().toLowerCase().replace(/[^a-z0-9]/g, '');
+const getCreditVaultAddressesEntryName = (strategyTokenName, underlyingSymbol) => {
+  const borrowerName = strategyTokenName.toString().replace(/^Pareto Credit Vault\s+/i, '');
+  return `credit${sanitizeCreditVaultEntryNamePart(borrowerName)}${sanitizeCreditVaultEntryNamePart(underlyingSymbol)}`;
+}
+const formatKnownNetworkContractReference = (_hre, address, preferredKeys = []) => {
+  if (!hasAddress(address)) {
+    return "''";
+  }
+
+  const networkContracts = getNetworkContracts(_hre);
+  const referenceName = getNetworkContractsReferenceName(_hre);
+  const contractKeys = [...preferredKeys, ...Object.keys(networkContracts)];
+  const seenKeys = new Set();
+
+  for (const key of contractKeys) {
+    if (seenKeys.has(key)) {
+      continue;
+    }
+    seenKeys.add(key);
+    if (hasAddress(networkContracts[key]) && sameAddress(networkContracts[key], address)) {
+      return `${referenceName}.${key}`;
+    }
+  }
+
+  return formatAddressValue(address);
+}
+const getCreditVaultDeploymentInterface = () => new ethers.utils.Interface([
+  'event CreditVaultDeployed(address creditVault,address strategy,address queue,address programmableBorrower,address keyringWhitelist,address writeOffEscrow)',
+]);
+const parseCreditVaultDeploymentArgs = (factoryAddress, eventArgs) => ({
+  factory: checksumAddress(factoryAddress),
+  creditVault: checksumAddress(eventArgs.creditVault || eventArgs[0]),
+  strategy: checksumAddress(eventArgs.strategy || eventArgs[1]),
+  queue: checksumAddress(eventArgs.queue || eventArgs[2]),
+  programmableBorrower: checksumAddress(eventArgs.programmableBorrower || eventArgs[3]),
+  keyringWhitelist: checksumAddress(eventArgs.keyringWhitelist || eventArgs[4]),
+  writeOffEscrow: checksumAddress(eventArgs.writeOffEscrow || eventArgs[5]),
+});
+const parseCreditVaultDeploymentReceipt = (receipt) => {
+  const deploymentEvent = (receipt.events || []).find(e => e.event === 'CreditVaultDeployed' && e.args);
+  if (deploymentEvent) {
+    return parseCreditVaultDeploymentArgs(deploymentEvent.address, deploymentEvent.args);
+  }
+
+  const deploymentInterface = getCreditVaultDeploymentInterface();
+  for (const log of receipt.logs || []) {
+    try {
+      const parsedLog = deploymentInterface.parseLog(log);
+      if (parsedLog.name === 'CreditVaultDeployed') {
+        return parseCreditVaultDeploymentArgs(log.address, parsedLog.args);
+      }
+    } catch (error) {
+      continue;
+    }
+  }
+
+  throw new Error('CreditVaultDeployed event not found in transaction receipt');
+}
+const formatCreditVaultAddressesEntry = (_hre, entry) => {
+  const hasEntryName = !helpers.isEmptyString(entry.name);
+  return [
+    hasEntryName ? `${entry.name}: {` : "{",
+    `  decimals: ${entry.decimals},`,
+    "  // strategyToken it's the strategy itself here",
+    `  strategyToken: ${formatAddressValue(entry.strategyToken)},`,
+    `  underlying: ${formatKnownNetworkContractReference(_hre, entry.underlying)},`,
+    `  cdoAddr: ${formatAddressValue(entry.cdoAddr)},`,
+    `  proxyAdmin: ${formatKnownNetworkContractReference(_hre, entry.proxyAdmin, ['proxyAdminWithTimelock', 'proxyAdminEOA', 'proxyAdmin'])},`,
+    `  strategy: ${formatAddressValue(entry.strategy)},`,
+    `  AATranche: ${formatAddressValue(entry.AATranche)},`,
+    `  BBTranche: ${formatAddressValue(entry.BBTranche)},`,
+    `  keyringWhitelist: ${formatAddressValue(entry.keyringWhitelist)},`,
+    `  queue: ${formatAddressValue(entry.queue)},`,
+    `  programmableBorrower: ${formatAddressValue(entry.programmableBorrower)},`,
+    `  writeOff: ${formatAddressValue(entry.writeOff)},`,
+    hasEntryName ? "}," : "}",
+  ].join("\n");
+}
+const getCreditVaultDeploymentProxyAdmin = async (_hre, deployment) => {
+  try {
+    return await getAdminAddress(_hre.ethers.provider, deployment.creditVault);
+  } catch (error) {
+    const factory = await _hre.ethers.getContractAt("IdleCreditVaultFactory", deployment.factory);
+    return factory.proxyAdmin();
+  }
+}
+const buildCreditVaultAddressesEntryFromDeployment = async (_hre, deployment) => {
+  const cdo = await _hre.ethers.getContractAt(
+    'contracts/IdleCDOEpochVariant.sol:IdleCDOEpochVariant',
+    deployment.creditVault
+  );
+  const [underlying, AATranche, BBTranche, proxyAdmin] = await Promise.all([
+    cdo.token(),
+    cdo.AATranche(),
+    cdo.BBTranche(),
+    getCreditVaultDeploymentProxyAdmin(_hre, deployment),
+  ]);
+  const underlyingToken = await _hre.ethers.getContractAt("IERC20Detailed", underlying);
+  const strategyToken = await _hre.ethers.getContractAt("IERC20Detailed", deployment.strategy);
+  const [decimals, underlyingSymbol, strategyTokenName] = await Promise.all([
+    underlyingToken.decimals(),
+    underlyingToken.symbol(),
+    strategyToken.name(),
+  ]);
+
+  return {
+    name: getCreditVaultAddressesEntryName(strategyTokenName, underlyingSymbol),
+    decimals: decimals.toString(),
+    strategyToken: deployment.strategy,
+    underlying,
+    cdoAddr: deployment.creditVault,
+    proxyAdmin,
+    strategy: deployment.strategy,
+    AATranche,
+    BBTranche,
+    keyringWhitelist: deployment.keyringWhitelist,
+    queue: deployment.queue,
+    programmableBorrower: deployment.programmableBorrower,
+    writeOff: deployment.writeOffEscrow,
+  };
+}
+const resolvePrintContractsInfoAddresses = (_hre, args = {}) => {
+  const trackedByName = getTrackedCreditVaultByName(_hre, args.name);
+  const cdoAddress = helpers.isEmptyString(args.cdo) ? trackedByName?.cdoAddr : args.cdo;
+  const trackedCdo = trackedByName || getTrackedCreditVault(_hre, cdoAddress);
+  const strategyAddress = helpers.isEmptyString(args.strategy) ? trackedCdo?.strategy : args.strategy;
+  const queueAddress = hasAddress(args.queue) ? args.queue : trackedCdo?.queue;
+  const writeOffAddress = hasAddress(args.writeoff) ? args.writeoff : getTrackedWriteOff(trackedCdo);
+  const orchestratorAddress = hasAddress(args.orchestrator) ? args.orchestrator : trackedCdo?.orchestrator;
+
+  return {
+    trackedCdo,
+    cdo: helpers.isEmptyString(cdoAddress) ? undefined : cdoAddress,
+    strategy: helpers.isEmptyString(strategyAddress) ? undefined : strategyAddress,
+    queue: hasAddress(queueAddress) ? queueAddress : undefined,
+    writeoff: hasAddress(writeOffAddress) ? writeOffAddress : undefined,
+    orchestrator: hasAddress(orchestratorAddress) ? orchestratorAddress : undefined,
+  };
+}
+// IdleCDOStorage.guardian is fixed at slot 208 in the established proxy layout.
+const getPrintContractsInfoGuardian = async (_hre, cdoAddress) => {
+  const value = await _hre.ethers.provider.getStorageAt(cdoAddress, 208);
+  return _hre.ethers.utils.getAddress(_hre.ethers.utils.hexDataSlice(value, 12));
+}
+const getPrintContractsInfoCdoFlags = async (cdo) => {
+  const [isInterestMinted, isDepositDuringEpochDisabled] = await Promise.all([
+    cdo.isInterestMinted(),
+    cdo.isDepositDuringEpochDisabled(),
+  ]);
+  return { isInterestMinted, isDepositDuringEpochDisabled };
+}
+const getPrintContractsInfoStrategyState = async (strategy) => {
+  const maxApr = await strategy.maxApr();
+  return { maxApr };
+}
+const getPrintContractsInfoOrchestratorState = async (orchestrator, cdoAddress) => {
+  const [owner, operator, isCreditVaultAllowed] = await Promise.all([
+    orchestrator.owner(),
+    orchestrator.operator(),
+    hasAddress(cdoAddress) ? orchestrator.isCreditVaultAllowed(cdoAddress) : null,
+  ]);
+  return { owner, operator, isCreditVaultAllowed };
+}
+const formatCreditVaultPercentage = (value) => {
+  const scaledValue = BN(value);
+  const whole = scaledValue.div('1000').toString();
+  const fraction = scaledValue.mod('1000').toString().padStart(3, '0').replace(/0+$/, '');
+  return fraction ? `${whole}.${fraction}%` : `${whole}%`;
+}
+const getPrintContractsInfoFeeAllocation = (feeSplit) => {
+  const feeReceiverShare = BN(feeSplit);
+  const ownerShare = BN(FULL_ALLOC).sub(feeReceiverShare);
+  return {
+    feeReceiverShare: feeReceiverShare.toString(),
+    feeReceiverPercentage: formatCreditVaultPercentage(feeReceiverShare),
+    ownerShare: ownerShare.toString(),
+    ownerPercentage: formatCreditVaultPercentage(ownerShare),
+  };
+}
+const DEFAULT_CREDIT_VAULT_BLUEPRINT = 'creditrevolvingblueprintusdc';
+const CREDIT_VAULT_BLUEPRINT_COMPONENT_ORDER = ['strategy', 'cdo', 'queue', 'revolving', 'writeoff'];
+const CREDIT_VAULT_UPGRADE_STRATEGY_ABI = [
+  'function defaultRecoveryInitialized() view returns (bool)',
+  'function pendingWithdraws() view returns (uint256)',
+  'function pendingInstantWithdraws() view returns (uint256)',
+];
+const CREDIT_VAULT_UPGRADE_CDO_ABI = [
+  'function defaulted() view returns (bool)',
+  'function epochEndDate() view returns (uint256)',
+];
+const CREDIT_VAULT_PREFUNDED_CDO_ABI = [
+  'function epochQueue() view returns (address)',
+];
+const assertCreditVaultUpgradeReady = async (_hre, trackedCdo, components, label) => {
+  const upgradingStrategy = components.includes('strategy');
+  const upgradingCdo = components.includes('cdo');
+  const upgradingQueue = components.includes('queue');
+  if (upgradingQueue && !upgradingCdo && hasAddress(trackedCdo.queue)) {
+    let configuredQueue;
+    try {
+      const prefundedCdo = await _hre.ethers.getContractAt(CREDIT_VAULT_PREFUNDED_CDO_ABI, trackedCdo.cdoAddr);
+      configuredQueue = await prefundedCdo.epochQueue();
+    } catch {
+      configuredQueue = null;
+    }
+    if (configuredQueue && hasAddress(configuredQueue) && sameAddress(configuredQueue, trackedCdo.queue)) {
+      throw new Error(`${label}: prefunded queue upgrade requires the CDO in the same batch`);
+    }
+  }
+  if (!upgradingStrategy && !upgradingCdo) return;
+  if (upgradingCdo && !upgradingStrategy) {
+    throw new Error(`${label}: select the strategy with the CDO so the strategy is upgraded first`);
+  }
+
+  const strategy = await _hre.ethers.getContractAt(CREDIT_VAULT_UPGRADE_STRATEGY_ABI, trackedCdo.strategy);
+  let recoveryInitialized = false;
+  try {
+    recoveryInitialized = await strategy.defaultRecoveryInitialized();
+  } catch {
+    // Older strategies do not expose this getter and are treated as uninitialized.
+  }
+  if (recoveryInitialized) return;
+
+  const pendingInstant = await strategy.pendingInstantWithdraws();
+  if (!pendingInstant.isZero()) {
+    throw new Error(`${label}: pendingInstantWithdraws must be zero before upgrade`);
+  }
+  const pending = await strategy.pendingWithdraws();
+  if (pending.isZero()) return;
+
+  const cdo = await _hre.ethers.getContractAt(CREDIT_VAULT_UPGRADE_CDO_ABI, trackedCdo.cdoAddr);
+  const endDate = await cdo.epochEndDate();
+  const isDefaulted = await cdo.defaulted();
+  if (isDefaulted) {
+    throw new Error(`${label}: cannot upgrade legacy pendingWithdraws after borrower default`);
+  }
+  if (endDate.isZero()) {
+    console.log(`${label}: stale closed-vault pending counters will normalize lazily`);
+    return;
+  }
+  console.log(`${label}: legacy pendingWithdraws must be fully funded by the next successful zero-loss stop`);
+};
+const getCreditVaultBlueprintUpgradeComponents = (rawComponents = CREDIT_VAULT_BLUEPRINT_COMPONENT_ORDER.join(',')) => {
+  const components = rawComponents.toString().split(',').map((component) => component.trim().toLowerCase()).filter(Boolean);
+  if (components.length === 0) {
+    throw new Error('components must be provided');
+  }
+
+  for (const component of components) {
+    if (!CREDIT_VAULT_BLUEPRINT_COMPONENT_ORDER.includes(component)) {
+      throw new Error(`Unsupported blueprint component ${component}`);
+    }
+  }
+
+  return [...new Set(components)].sort(
+    (left, right) => CREDIT_VAULT_BLUEPRINT_COMPONENT_ORDER.indexOf(left) - CREDIT_VAULT_BLUEPRINT_COMPONENT_ORDER.indexOf(right)
+  );
+};
+const getCreditVaultBlueprintUpgradeTargets = (trackedCdo, components = CREDIT_VAULT_BLUEPRINT_COMPONENT_ORDER) => ([
+  {
+    component: 'strategy',
+    label: 'Strategy',
+    proxy: trackedCdo.strategy,
+    contractName: 'contracts/strategies/idle/IdleCreditVault.sol:IdleCreditVault',
+  },
+  {
+    component: 'cdo',
+    label: 'Credit vault',
+    proxy: trackedCdo.cdoAddr,
+    contractName: 'contracts/IdleCDOEpochVariant.sol:IdleCDOEpochVariant',
+  },
+  {
+    component: 'queue',
+    label: 'Queue',
+    proxy: trackedCdo.queue,
+    contractName: 'contracts/IdleCDOEpochQueue.sol:IdleCDOEpochQueue',
+  },
+  {
+    component: 'revolving',
+    label: 'Programmable borrower',
+    proxy: trackedCdo.programmableBorrower,
+    contractName: 'contracts/strategies/idle/ProgrammableBorrower.sol:ProgrammableBorrower',
+  },
+  {
+    component: 'writeoff',
+    label: 'Write-off escrow',
+    proxy: getTrackedWriteOff(trackedCdo),
+    contractName: 'contracts/IdleCreditVaultWriteOffEscrow.sol:IdleCreditVaultWriteOffEscrow',
+  },
+]).filter(({ component, proxy }) => components.includes(component) && hasAddress(proxy));
+const getWriteOffEscrowContractName = (chainId) => ({
+  1: 'IdleCreditVaultWriteOffEscrow',
+  10: null,
+  137: null,
+  1101: null,
+  42161: null,
+  8453: 'IdleCreditVaultWriteOffEscrow',
+  43114: 'IdleCreditVaultWriteOffEscrow',
+})[chainId];
+
+const buildCreditVaultAncillaryParams = async ({ deployToken, copyToken, networkContracts, includeWriteOff = true }) => {
+  const keyringDisabled = !helpers.isEmptyString(deployToken.keyring) && normalizeAddress(deployToken.keyring) === addr0;
+  const shouldDeployKeyring = !keyringDisabled;
+  const params = {
+    keyring: shouldDeployKeyring ? networkContracts.keyring : addr0,
+    queueImplementation: addr0,
+    prefundedDepositWindow: deployToken.prefundedDeposits ? (deployToken.prefundedDepositsWindows || '0') : '0',
+    writeOffImplementation: addr0,
+  };
+
+  if (deployToken.queue) {
+    params.queueImplementation = await getImplementationAddress(hre.ethers.provider, copyToken.queue);
+    console.log(`Queue implementation: ${params.queueImplementation}`);
+  }
+
+  if (deployToken.writeoff && includeWriteOff) {
+    const configuredWriteOffImplementation =
+      deployToken.writeOffImplementation ||
+      deployToken.writeoffImplementation ||
+      networkContracts.writeOffImplementation ||
+      networkContracts.writeoffImplementation;
+    const trackedWriteOff = getTrackedWriteOff(copyToken);
+    if (hasAddress(configuredWriteOffImplementation)) {
+      params.writeOffImplementation = configuredWriteOffImplementation;
+    } else if (hasAddress(trackedWriteOff)) {
+      params.writeOffImplementation = await getImplementationAddress(hre.ethers.provider, trackedWriteOff);
+    } else {
+      throw new Error('writeoff is enabled but no writeOffImplementation and no copy writeOff proxy were found');
+    }
+    if (params.writeOffImplementation != addr0) {
+      console.log(`Write-off implementation: ${params.writeOffImplementation}`);
+    }
+  } else if (deployToken.writeoff) {
+    console.log('Write-off escrow is not supported for revolving credit vaults; skipping');
+  }
+
+  if (shouldDeployKeyring) {
+    console.log(`Factory will deploy KeyringIdleWhitelist using Keyring contract ${params.keyring}`);
+  } else {
+    console.log('Keyring disabled');
+  }
+
+  return { params };
+};
+
+/**
+ * @name deploy
+ * deploy factory for CDOs
+ */
+task("hypernative-setup", "Deploy IdleCDOFactory")
+  .setAction(async (args) => {
+    const networkContracts = getNetworkContracts(hre);
+    const signer = await helpers.getSigner();
+    const pauseModule = new ethers.Contract(networkContracts.hypernativeModule, HypernativeModuleAbi, signer);
+    console.log(`Setting contract to hypernative pauser module ${networkContracts.hypernativeModule}`);
+
+    const tx = await pauseModule.replaceProtectedContracts([
+      // best yield / USP contracts
+      // USP
+      { contractAddress: '0x97cCC1C046d067ab945d3CF3CC6920D3b1E54c88', contractType: 0 },
+      // USP queue
+      { contractAddress: '0xA7780086ab732C110E9E71950B9Fb3cb2ea50D89', contractType: 0 },
+      // sUSP
+      { contractAddress: '0x271C616157e69A43B4977412A64183Cf110Edf16', contractType: 0 },
+
+      // tranches
+      // lido
+      { contractAddress: '0x34dCd573C5dE4672C8248cd12A99f875Ca112Ad8', contractType: 1 },
+      // instasteth
+      { contractAddress: '0x8E0A8A5c1e5B3ac0670Ea5a613bB15724D51Fc37', contractType: 1 },
+      // mmusdcsteakusdc
+      { contractAddress: '0x87E53bE99975DA318056af5c4933469a6B513768', contractType: 1 },
+      // ethenasusde
+      { contractAddress: '0x1EB1b47D0d8BCD9D761f52D26FCD90bBa225344C', contractType: 1 },
+      // gearboxweth
+      { contractAddress: '0xbc48967C34d129a2ef25DD4dc693Cc7364d02eb9', contractType: 1 },
+      // gearboxusdc
+      { contractAddress: '0xdd4D030A4337CE492B55bc5169F6A9568242C0Bc', contractType: 1 },
+
+      // credit vaults
+      // fasanara usdc 
+      { contractAddress: '0xf6223C567F21E33e859ED7A045773526E9E3c2D5', contractType: 1 },
+      // bastion usdc 
+      { contractAddress: '0x4462eD748B8F7985A4aC6b538Dfc105Fce2dD165', contractType: 1 },
+
+      // DEPRECATED BY
+      // { contractAddress: '0xC8E6CA6E96a326dC448307A5fDE90a0b21fd7f80', contractType: 0 },
+      // { contractAddress: '0xeC9482040e6483B7459CC0Db05d51dfA3D3068E1', contractType: 0 },
+      // { contractAddress: '0xDc7777C771a6e4B3A82830781bDDe4DBC78f320e', contractType: 0 },
+      // { contractAddress: '0xfa3AfC9a194BaBD56e743fA3b7aA2CcbED3eAaad', contractType: 0 },
+      // { contractAddress: '0x62A0369c6BB00054E589D12aaD7ad81eD789514b', contractType: 0 },
+
+      // DEPRECATED Tranches
+      // cpfasusdt
+      // { contractAddress: '0xc4574C60a455655864aB80fa7638561A756C5E61', contractType: 1 },
+      // cpwincusdc
+      // { contractAddress: '0xd12f9248dEb1D972AA16022B399ee1662d51aD22', contractType: 1 },
+      // morphoaaveusdc
+      // { contractAddress: '0x9C13Ff045C0a994AF765585970A5818E1dB580F8', contractType: 1 },
+      // morphoaavedai
+      // { contractAddress: '0xDB82dDcb7e2E4ac3d13eBD1516CBfDb7b7CE0ffc', contractType: 1 },
+      // morphoaaveusdt
+      // { contractAddress: '0x440ceAd9C0A0f4ddA1C81b892BeDc9284Fc190dd', contractType: 1 },
+      // morphoaaveweth
+      // { contractAddress: '0xb3F717a5064D2CBE1b8999Fdfd3F8f3DA98339a6', contractType: 1 },
+      // amphorwsteth
+      // { contractAddress: '0x9e0c5ee5e4B187Cf18B23745FCF2b6aE66a9B52f', contractType: 1 },
+      // mmwethbbweth
+      // { contractAddress: '0x260D1E0CB6CC9E34Ea18CE39bAB879d450Cdd706', contractType: 1 },
+      // // cpPOR_USDC
+      // { contractAddress: '0x1329E8DB9Ed7a44726572D44729427F132Fa290D', contractType: 1 },
+      // // cpPOR_DAI
+      // { contractAddress: '0x5dcA0B3Ed7594A6613c1A2acd367d56E1f74F92D', contractType: 1 },
+      // // cpfasusdc
+      // { contractAddress: '0xE7C6A4525492395d65e736C3593aC933F33ee46e', contractType: 1 },
+      // // mmwethre7weth
+      // { contractAddress: '0xA8d747Ef758469e05CF505D708b2514a1aB9Cc08', contractType: 1 },
+      // // mmwethre7wethfarm
+      // { contractAddress: '0xD071EA5D2575E155E4e9c2234968D1E11B8a920E', contractType: 1 },
+    ]);
+    await tx.wait();
+    console.log('Hypernative setup done');
+  })
+
+/**
+* @name deploy
+* deploy factory for CDOs
+*/
+task("deploy-hypernative-pauser", "Deploy HypernativeBatchPauser")
+  .setAction(async (args) => {
+    // Run 'compile' task
+    await run("compile");
+
+    const networkContracts = getNetworkContracts(hre);
+    const signer = await helpers.getSigner();
+    const creator = await signer.getAddress();
+    const contractName = "HypernativeBatchPauser";
+
+    console.log("creator: ", creator);
+    console.log("network: ", hre.network.name);
+    
+    const pauser = networkContracts.hypernativePauserEOA;
+    const protectedContracts = [
+    ];
+    console.log("Params :");
+    console.log("pauser: ", pauser);
+    console.log("protectedContracts: ", protectedContracts);
+
+    await helpers.prompt("continue? [y/n]", true);
+
+    const contract = await helpers.deployContract(contractName, [pauser, protectedContracts], signer);
+    console.log(`${contractName} deployed at ${contract.address}`);
+  
+    await run("verify:verify", {
+      constructorArguments: [pauser, protectedContracts],
+      address: contract.address,
+      contract: "contracts/HypernativeBatchPauser.sol:HypernativeBatchPauser"
+    });
+
+    return contract.address;
+  });
+
+/**
+ * @name deploy
+ * deploy factory for CDOs
+ */
+task("deploy-generic-contract", "Deploy generic contract")
+  .addParam('contractname')
+  .setAction(async (args) => {
+    // Run 'compile' task
+    await run("compile");
+
+    const contractName = args.contractname;
+    const signer = await helpers.getSigner();
+    const creator = await signer.getAddress();
+
+    console.log("creator: ", creator);
+    console.log("network: ", hre.network.name);
+    console.log("contractName: ", contractName);
+    await helpers.prompt("continue? [y/n]", true);
+
+    const contractAddr = await helpers.deployContract(contractName, [], signer);
+    console.log(`${contractName} deployed at ${contractAddr}`);
+    return contractAddr;
+  });
+
+/**
+ * @name deploy
+ * deploy factory for CDOs
+ */
+task("deploy-cdo-factory", "Deploy IdleCDOFactory")
+  .setAction(async (args) => {
+    // Run 'compile' task
+    await run("compile");
+
+    const signer = await helpers.getSigner();
+    const creator = await signer.getAddress();
+
+    console.log("creator: ", creator);
+    console.log("network: ", hre.network.name);
+    await helpers.prompt("continue? [y/n]", true);
+
+    const cdoFactory = await helpers.deployContract("IdleCDOFactory", [], signer);
+    console.log("cdoFactory deployed at", cdoFactory.address);
+    return cdoFactory;
+  });
+
+/**
+ * @name deploy-cdo-with-factory
+ * subtask to deploy CDO with factory and params provided
+ */
+subtask("deploy-cdo-with-factory", "Deploy IdleCDO using IdleCDOFactory with all params provided")
+  .addParam('cdoImplementation', "The CDO implementation address", "", types.string, true)
+  .addParam('cloneFromProxy', "The CDO proxy to clone the implementation from", "", types.string, true)
+  .addParam('proxyAdmin', "The ProxyAdmin address", "", types.string, true)
+  .addParam('cdoUnderlying', "The CDO's underlying address", "", types.string, true)
+  .addParam('limit', "CDO param _limit")
+  .addParam('governanceFund', "CDO param _governanceFund")
+  .addParam('strategy', "CDO param _strategy")
+  .addParam('trancheAPRSplitRatio', "CDO param _trancheAPRSplitRatio")
+  .setAction(async (args) => {
+    const signer = await helpers.getSigner();
+    const creator = await signer.getAddress();
+    let proxyAdminAddress = args.proxyAdmin;
+    const isMatic = hre.network.name == 'matic' || hre.network.config.chainId == 137;
+    const isPolygonZK = hre.network.name == 'polygonzk' || hre.network.config.chainId == 1101;
+    const isOptimism = hre.network.name == 'optimism' || hre.network.config.chainId == 10;
+    const isArbitrum = hre.network.name == 'arbitrum' || hre.network.config.chainId == 42161;
+
+    const networkContracts = getNetworkContracts(hre);
+
+    if (!proxyAdminAddress) {
+      const defaultProxyAdminAddress = networkContracts.proxyAdmin;
+      console.log("⚠️  proxyAdmin not specified. Using the default one: ", defaultProxyAdminAddress);
+      proxyAdminAddress = defaultProxyAdminAddress;
+    }
+
+    if (helpers.isEmptyString(args.cdoImplementation) && helpers.isEmptyString(args.cloneFromProxy)) {
+      throw("cdoImplementationAddress or cloneFromProxy must be specified");
+    }
+
+    let cdoImplementationAddress = args.cdoImplementation;
+    if (helpers.isEmptyString(cdoImplementationAddress)) {
+      console.log("\n🔎 Retrieving implementation from proxy (", args.cloneFromProxy, ")");
+      cdoImplementationAddress = await getImplementationAddress(hre.ethers.provider, args.cloneFromProxy);
+      console.log("🔎 using implementation address", cdoImplementationAddress);
+    }
+
+    let cdoFactoryAddress = networkContracts.cdoFactory;
+    const limit = args.limit;
+    const governanceFund = args.governanceFund;
+    const strategyAddress = args.strategy;
+    const trancheAPRSplitRatio = args.trancheAPRSplitRatio;
+
+    console.log("🔎 Retrieving underlying token from strategy (", strategyAddress, ")");
+    const strategy = await ethers.getContractAt("IIdleCDOStrategy", strategyAddress, signer);
+    const underlyingAddress = await strategy.token();
+    const underlyingAddressCDO = args.cdoUnderlying;
+    const underlyingToken = await ethers.getContractAt("IERC20Detailed", underlyingAddress, signer);
+    const underlyingName = await underlyingToken.name();
+    const underlyingTokenCDO = await ethers.getContractAt("IERC20Detailed", underlyingAddressCDO, signer);
+    const underlyingNameCDO = await underlyingTokenCDO.name();
+
+    if (hre.network.name === 'hardhat' && !cdoFactoryAddress) {
+      console.log("\n⚠️  Local network - cdoFactoryAddress is undefined, deploying CDOFactory\n");
+      const cdoFactory = await hre.run("deploy-cdo-factory");
+      cdoFactoryAddress = cdoFactory.address;
+    }
+
+    if (helpers.isEmptyString(cdoFactoryAddress)) {
+      console.log("🛑 cdoFactoryAddress must be specified")
+      return;
+    }
+
+    console.log()
+    console.log("🟩🟩🟩 IdleCDO params 🟩🟩🟩");
+    console.log("creator:                 ", creator);
+    console.log("network:                 ", hre.network.name);
+    console.log("proxyAdmin:              ", proxyAdminAddress);
+    console.log("factory:                 ", cdoFactoryAddress);
+    console.log("underlying (strategy):   ", `${underlyingAddress} (${underlyingName})`);
+    console.log("underlying (cdo):        ", `${underlyingAddressCDO} (${underlyingNameCDO})`);
+    console.log("cdoImplementation:       ", cdoImplementationAddress);
+    console.log("limit:                   ", limit.toString());
+    console.log("governanceFund:          ", governanceFund);
+    console.log("Strategy address:        ", strategyAddress);
+    console.log("trancheAPRSplitRatio:    ", trancheAPRSplitRatio.toString());
+    console.log()
+    
+    await helpers.prompt("continue? [y/n]", true);
+    
+    let cdoFactory = await ethers.getContractAt("IdleCDOFactory", cdoFactoryAddress, signer);
+    cdoFactory = cdoFactory.connect(signer);
+    let contractName = isMatic ? "IdleCDOPolygon" : "IdleCDO";
+    if (isPolygonZK) {
+      contractName = "IdleCDOPolygonZK";
+    } else if (isOptimism) {
+      contractName = "IdleCDOOptimism";
+    } else if (isArbitrum) {
+      contractName = "IdleCDOArbitrum";
+    }
+    const idleCDO = await ethers.getContractAt(contractName, cdoImplementationAddress, signer);
+    
+    const initMethodCall = idleCDO.interface.encodeFunctionData("initialize", [
+      limit,
+      underlyingAddressCDO,
+      governanceFund, // recovery address
+      creator, // guardian
+      addr0, // unused initializer slot on credit vaults
+      strategyAddress,
+      trancheAPRSplitRatio
+    ]);
+    
+    console.log("deploying with factory...");
+    let res = await cdoFactory.deployCDO(cdoImplementationAddress, proxyAdminAddress, initMethodCall);
+    res = await res.wait();
+    const cdoDeployFilter = cdoFactory.filters.CDODeployed;
+    const events = await cdoFactory.queryFilter(cdoDeployFilter, "latest");
+    console.log('events', events);
+    console.log('res.events', res.events);
+    const proxyAddress = res.events[7].args.proxy;
+    helpers.log(`📤 IdleCDO created (proxy via CDOFactory): ${proxyAddress} @tx: ${res.hash}, (gas ${res.cumulativeGasUsed.toString()})`);
+    return proxyAddress;
+  });
+  
+/**
+ * @name deploy-with-factory
+ * task to deploy CDO and staking rewards with factory and basic params from utils/addresses.js
+ */
+task("deploy-with-factory", "Deploy IdleCDO with CDOFactory, IdleStrategy and Staking contract for rewards with default parameters")
+  .addParam('cdoname')
+  .addParam('proxyCdoAddress')
+  .addOptionalParam('strategyAddress', 'Strategy address to use', '')
+  .addOptionalParam('strategyName', 'Strategy name for the interface to use', '')
+  .addOptionalParam('limit', 'Strategy cap', '1000000')
+  .addOptionalParam('aaRatio', '% of interest that goes to AA holders (100000 is 100%)', '10000')
+  .addOptionalParam('aaStaking', 'flag whether AA staking is active', true, types.boolean)
+  .addOptionalParam('bbStaking', 'flag whether BB staking is active', false, types.boolean)
+  .addOptionalParam('stkAAVEActive', 'flag whether the IdleCDO receives stkAAVE', true, types.boolean)
+  .addOptionalParam('proxyAdmin', 'ProxyAdmin address override', '', types.string)
+  .setAction(async (args) => {
+    const cdoname = args.cdoname;
+    let cdoProxyAddressToClone = args.proxyCdoAddress;
+    const proxyAdminAddress = args.proxyAdmin;
+    let strategyAddress = args.strategyAddress;
+    const isMatic = hre.network.name == 'matic' || hre.network.config.chainId == 137;
+    const isPolygonZK = hre.network.name == 'polygonzk' || hre.network.config.chainId == 1101;
+    const isOptimism = hre.network.name == 'optimism' || hre.network.config.chainId == 10;
+    const isArbitrum = hre.network.name == 'arbitrum' || hre.network.config.chainId == 42161;
+    const isBase = hre.network.name == 'base' || hre.network.config.chainId == 8453;
+    const isAvax = hre.network.name == 'avax' || hre.network.config.chainId == 43114;
+
+    const networkTokens = getDeployTokens(hre);
+
+    // Get config params
+    const deployToken = networkTokens[args.cdoname];
+    const networkContracts = getNetworkContracts(hre);
+    
+    if (deployToken === undefined) {
+      console.log(`🛑 deployToken not found with specified cdoname (${cdoname})`)
+      return;
+    }
+    const programmableBorrowerConfig = getProgrammableBorrowerConfig(deployToken);
+    if (programmableBorrowerConfig && !deployToken.isCreditVault) {
+      console.log("🛑 programmable borrower can be used only with credit vault deployments");
+      return;
+    }
+
+    const cdoConfig = getNetworkCDOs(hre)[args.cdoname] || {};
+    const signer = await helpers.getSigner();
+    if (helpers.isEmptyString(strategyAddress) && hasAddress(cdoConfig.strategy)) {
+      strategyAddress = cdoConfig.strategy;
+      console.log("Using existing Strategy: ", strategyAddress);
+    }
+    if (helpers.isEmptyString(strategyAddress)) {
+      console.log("🛑 strategyAddress must be specified or available in CDO config");
+      return;
+    }
+    let strategy = await ethers.getContractAt(args.strategyName, strategyAddress, signer);
+    const creator = await signer.getAddress();
+    let networkCDOName = isMatic ? 'IdleCDOPolygon' : 'IdleCDO';
+    if (isPolygonZK) {
+      networkCDOName = 'IdleCDOPolygonZK';
+    } else if (isOptimism) {
+      networkCDOName = 'IdleCDOOptimism';
+    } else if (isArbitrum) {
+      networkCDOName = 'IdleCDOArbitrum';
+    } else if (isBase) {
+      networkCDOName = 'IdleCDOBase';
+    } else if (isAvax) {
+      networkCDOName = 'IdleCDOAvax';
+    }
+    let idleCDOAddress;
+    const contractName = deployToken.cdoVariant || networkCDOName;
+    if (!helpers.isEmptyString(proxyAdminAddress)) {
+      console.log("ProxyAdmin override:     ", proxyAdminAddress);
+    }
+
+    if (hasAddress(cdoConfig.cdoAddr)) {
+      idleCDOAddress = cdoConfig.cdoAddr;
+      console.log("Using existing CDO:      ", idleCDOAddress);
+    } else if (helpers.isEmptyString(cdoProxyAddressToClone)) {
+      console.log("🛑 cdoProxyAddressToClone must be specified");
+      await helpers.prompt(`Deploy a new instance of ${contractName}? [y/n]`, true);
+
+      const newCDO = await helpers.deployUpgradableContract(
+        contractName,
+        [
+          BN(args.limit).mul(ONE_TOKEN(deployToken.decimals)), // limit
+          deployToken.underlying,
+          networkContracts.treasuryMultisig, // recovery address
+          creator, // guardian
+          networkContracts.rebalancer,
+          strategy.address,
+          BN(args.aaRatio) // apr split: 10% interest to AA and 90% BB
+        ],
+        signer,
+        proxyAdminAddress
+      );
+      idleCDOAddress = newCDO.address;
+    } else {
+      await helpers.prompt("continue? [y/n]", true);
+  
+      const deployParams = {
+        cdoUnderlying: deployToken.underlying,
+        cloneFromProxy: cdoProxyAddressToClone,
+        limit: BN(args.limit).mul(ONE_TOKEN(deployToken.decimals)).toString(), // limit
+        governanceFund: networkContracts.treasuryMultisig, // recovery address
+        strategy: strategy.address,
+        trancheAPRSplitRatio: BN(args.aaRatio).toString(), // apr split: 10% interest to AA and 80% BB
+        proxyAdmin: proxyAdminAddress,
+      }
+      idleCDOAddress = await hre.run("deploy-cdo-with-factory", deployParams);
+    }
+
+    const idleCDO = await ethers.getContractAt(contractName, idleCDOAddress, signer);
+    console.log('owner idleCDO', await idleCDO.owner());
+
+    const AAaddr = await idleCDO.AATranche();
+    const BBaddr = await idleCDO.BBTranche();
+    console.log(`AATranche: ${AAaddr}, BBTranche: ${BBaddr}`);
+    console.log()
+
+    let programmableBorrower;
+
+    if (programmableBorrowerConfig) {
+      const currentUnscaledApr = await strategy.unscaledApr();
+      const currentApr = await strategy.getApr();
+      if (!currentUnscaledApr.eq(0) || !currentApr.eq(0)) {
+        console.log("Setting strategy APRs to 0 for programmable borrower mode");
+        await strategy.connect(signer).setAprs(0, 0);
+      }
+    }
+
+    if (strategy.setWhitelistedCDO && (await strategy.idleCDO())?.toLowerCase() != idleCDO.address.toLowerCase()) {
+      console.log("Setting whitelisted CDO");
+      await strategy.connect(signer).setWhitelistedCDO(idleCDO.address);
+    }
+
+    console.log(`Setting isAYSActive to ${args.isAYSActive}`);
+    await idleCDO.connect(signer).setIsAYSActive(args.isAYSActive);
+
+    if (deployToken.rewardsData && deployToken.rewardsData.length > 0) {
+      console.log('setting metamorpho rewards data');
+      for (let i = 0; i < deployToken.rewardsData.length; i++) {
+        const data = deployToken.rewardsData[i];
+        console.log('setting reward data', { id: data.id, sender: data.sender, urd: data.urd, reward: data.reward, marketId: data.marketId, uniV3Path: data.uniV3Path});
+        await strategy.connect(signer).setRewardData(data.id, data.sender, data.urd, data.reward, data.marketId, data.uniV3Path);
+      }
+    }
+
+    const feeReceiver = await idleCDO.feeReceiver();
+    const cdoFee = await idleCDO.fee();
+    const fee = deployToken.fees === undefined ? cdoFee : deployToken.fees;
+    if (deployToken.isCreditVault) {
+      const configuredFeeReceiver = getCreditVaultFeeReceiver(deployToken, networkContracts.treasuryMultisig);
+      const feeSplit = getCreditVaultFeeSplit(deployToken);
+      const managementFee = deployToken.managementFee === undefined ? await idleCDO.managementFee() : deployToken.managementFee;
+      const cdoFeeSplit = await idleCDO.feeSplit();
+      const cdoManagementFee = await idleCDO.managementFee();
+      if (
+        feeReceiver.toLowerCase() != configuredFeeReceiver.toLowerCase() ||
+        cdoFee.toString() != fee.toString() ||
+        cdoFeeSplit.toString() != feeSplit.toString() ||
+        cdoManagementFee.toString() != managementFee.toString()
+      ) {
+        console.log('Setting credit vault fee params with ', configuredFeeReceiver, fee, feeSplit, managementFee);
+        await idleCDO.connect(signer)["setFeeParams(address,uint256,uint256,uint256)"](
+          configuredFeeReceiver,
+          fee,
+          feeSplit,
+          managementFee
+        );
+      }
+    } else if (
+      feeReceiver.toLowerCase() != networkContracts.feeReceiver.toLowerCase() ||
+      cdoFee.toString() != fee.toString()
+    ) {
+      console.log('Setting fee params with ', networkContracts.feeReceiver, fee);
+      await idleCDO.connect(signer)["setFeeParams(address,uint256)"](networkContracts.feeReceiver, fee);
+    }
+
+    if (deployToken.unlent == 0 && !deployToken.isCreditVault) {
+      console.log('Setting unlent to 0')
+      await idleCDO.connect(signer).setUnlentPerc(0);
+    }
+
+    if (deployToken.farmTranche) {
+      console.log('Farming CDO: Setting loss always socialized')
+      await idleCDO.connect(signer).setLossToleranceBps(100000);
+    }
+
+    if (deployToken.isCreditVault) {
+      console.log('Setting credit vault');
+      const cdoEpoch = await ethers.getContractAt('contracts/IdleCDOEpochVariant.sol:IdleCDOEpochVariant', idleCDOAddress, signer);
+      const currentEpochDuration = await cdoEpoch.epochDuration();
+      const currentBufferPeriod = await cdoEpoch.bufferPeriod();
+      if ((deployToken.epochDuration || deployToken.bufferPeriod) && (!currentEpochDuration.eq(BN(deployToken.epochDuration)) || !currentBufferPeriod.eq(BN(deployToken.bufferPeriod)))) {
+        console.log(`Setting epoch duration to ${deployToken.epochDuration}, buffer period to ${deployToken.bufferPeriod}`);
+        await cdoEpoch.connect(signer).setEpochParams(BN(deployToken.epochDuration), BN(deployToken.bufferPeriod));
+      }
+      const currentDisableInstantWithdraw = await cdoEpoch.disableInstantWithdraw();
+      const currentInstantWithdrawDelay = await cdoEpoch.instantWithdrawDelay();
+      const currentInstantWithdrawAprDelta = await cdoEpoch.instantWithdrawAprDelta();
+      if ((deployToken.disableInstantWithdraw || deployToken.instantWithdrawDelay || deployToken.instantWithdrawAprDelta) && 
+          (currentDisableInstantWithdraw != deployToken.disableInstantWithdraw) || 
+           !currentInstantWithdrawDelay.eq(BN(deployToken.instantWithdrawDelay)) || 
+           !currentInstantWithdrawAprDelta.eq(BN(deployToken.instantWithdrawAprDelta))) {
+        console.log(`Setting instant withdraw params disable: ${deployToken.disableInstantWithdraw}, instant delay: ${deployToken.instantWithdrawDelay}, instant apr delta ${deployToken.instantWithdrawAprDelta}`);
+        await cdoEpoch.connect(signer).setInstantWithdrawParams(
+          BN(deployToken.instantWithdrawDelay), 
+          BN(deployToken.instantWithdrawAprDelta), 
+          deployToken.disableInstantWithdraw
+        );
+      }
+      if (helpers.isEmptyString(deployToken.keyring) && deployToken.keyring != addr0 && hasAddress(cdoConfig.keyringWhitelist)) {
+        deployToken.keyring = cdoConfig.keyringWhitelist;
+        console.log("Using existing keyring:  ", deployToken.keyring);
+      }
+      const currentKeyring = await cdoEpoch.keyring();
+      const currentKeyringPolicy = await cdoEpoch.keyringPolicyId();
+      if (deployToken.keyring && (deployToken.keyring.toLowerCase() != currentKeyring.toLowerCase() || deployToken.keyringPolicy != currentKeyringPolicy)) {
+        console.log(`Setting keyring ${deployToken.keyring}, policy ${deployToken.keyringPolicy}`);
+        await cdoEpoch.connect(signer).setKeyringParams(deployToken.keyring, deployToken.keyringPolicy);
+      } else if (!deployToken.keyring) {
+        console.log(`Deploying new keyring with default params and setting it`);
+        const newKeyring = await run("deploy-keyring-whitelist", { owner: networkContracts.deployer });
+        deployToken.keyring = newKeyring;
+        console.log(`Setting keyring ${deployToken.keyring}, policy ${deployToken.keyringPolicy}`);
+        await cdoEpoch.connect(signer).setKeyringParams(deployToken.keyring, deployToken.keyringPolicy);
+      }
+      if (deployToken.interestMinted && !await cdoEpoch.isInterestMinted()) {
+        console.log(`Setting interest minted ${deployToken.interestMinted}`);
+        await cdoEpoch.connect(signer).setIsInterestMinted(deployToken.interestMinted);
+      }
+      if (!deployToken.depositDuringEpoch) {
+        console.log(`Setting deposit during epoch ${deployToken.depositDuringEpoch}`);
+        await cdoEpoch.connect(signer).setIsDepositDuringEpochDisabled(!deployToken.depositDuringEpoch);
+      }
+      if (deployToken.queue) {
+        let queue = cdoConfig.queue;
+        if (!hasAddress(queue)) {
+          queue = await hre.run("deploy-queue", {
+            cdo: idleCDOAddress,
+            // owner: '0xE5Dab8208c1F4cce15883348B72086dBace3e64B',
+            owner: networkContracts.treasuryMultisig,
+            isaa: 'true',
+            keyring: deployToken.keyring != addr0 ? deployToken.keyring : undefined,
+            proxyAdmin: proxyAdminAddress,
+          });
+        } else {
+          console.log("Using existing queue:    ", queue);
+        }
+
+        if (deployToken.prefundedDeposits) {
+          console.log(`Setting prefunded deposits queue ${queue} and enabling prefunded deposits`);
+          const cdoPrefundedVariant = await ethers.getContractAt('contracts/IdleCDOEpochVariantPrefunded.sol:IdleCDOEpochVariantPrefunded', idleCDOAddress, signer);
+          await cdoPrefundedVariant.connect(signer).setEpochQueue(queue);
+
+          console.log(`Setting prefunded deposits window -> seconds: ${deployToken.prefundedDepositsWindows}`);
+          const queueContract = await ethers.getContractAt('IdleCDOEpochQueue', queue, signer);
+          await queueContract.setPrefundedDepositWindow(deployToken.prefundedDepositsWindows);
+        }
+      }
+      if (programmableBorrowerConfig) {
+        let deployedProgrammableBorrower = false;
+        programmableBorrower = cdoConfig.programmableBorrower;
+        if (!hasAddress(programmableBorrower)) {
+          programmableBorrower = await hre.run("deploy-programmable-borrower", {
+            cdo: idleCDOAddress,
+            vault: programmableBorrowerConfig.vault,
+            manager: programmableBorrowerConfig.manager,
+            borrower: programmableBorrowerConfig.borrower,
+            borrowerapr: programmableBorrowerConfig.borrowerApr,
+            proxyAdmin: proxyAdminAddress,
+          });
+          deployedProgrammableBorrower = true;
+        } else {
+          console.log("Using existing ProgrammableBorrower:", programmableBorrower);
+        }
+
+        if ((await strategy.borrower()).toLowerCase() != programmableBorrower.toLowerCase()) {
+          console.log(`Setting strategy borrower to ProgrammableBorrower ${programmableBorrower}`);
+          await strategy.connect(signer).setBorrower(programmableBorrower);
+        }
+
+        if (!await cdoEpoch.isProgrammableBorrower()) {
+          console.log('Enabling programmable borrower mode');
+          await cdoEpoch.connect(signer).setIsProgrammableBorrower(true);
+        }
+
+        if (!await cdoEpoch.isInterestMinted()) {
+          console.log('Enabling minted interest for programmable borrower mode');
+          await cdoEpoch.connect(signer).setIsInterestMinted(true);
+        }
+        if (!await cdoEpoch.disableInstantWithdraw()) {
+          console.log(`Disabling instant withdraw`);
+          await cdoEpoch.connect(signer).setInstantWithdrawParams(0, 0, true);
+        }
+
+        const programmableBorrowerContract = await ethers.getContractAt("ProgrammableBorrower", programmableBorrower, signer);
+        if (deployedProgrammableBorrower) {
+          console.log(`Transfer ownership of ProgrammableBorrower to TL multisig ${networkContracts.treasuryMultisig}`);
+          await programmableBorrowerContract.connect(signer).transferOwnership(networkContracts.treasuryMultisig);
+        }
+      }
+
+      if (deployToken.writeoff) {
+        if (programmableBorrowerConfig) {
+          console.log('Skipping write off escrow for programmable borrower deployment');
+        } else {
+          const writeOffEscrow = cdoConfig.writeOff || cdoConfig.writeoff;
+          if (!hasAddress(writeOffEscrow)) {
+            console.log('Deploying write off escrow');
+            await hre.run("deploy-writeoff-escrow", { cdo: idleCDOAddress, proxyAdmin: proxyAdminAddress });
+          } else {
+            console.log("Using existing write off escrow:", writeOffEscrow);
+          }
+        }
+      }
+    }
+
+    console.log(`Set guardian of CDO to Pause multisig ${networkContracts.pauserMultisig}`);
+    await idleCDO.connect(signer).setGuardian(networkContracts.pauserMultisig);
+    
+    console.log(`Transfer ownership of strategy to DL multisig ${networkContracts.devLeagueMultisig}`);
+    await strategy.connect(signer).transferOwnership(networkContracts.devLeagueMultisig);
+
+    console.log(`Transfer ownership of CDO to TL multisig ${networkContracts.treasuryMultisig}`);
+    await idleCDO.connect(signer).transferOwnership(networkContracts.treasuryMultisig);
+
+    await hre.run("protect-cdo", { cdo: idleCDOAddress });
+    
+    return {idleCDO, strategy, AAaddr, BBaddr, programmableBorrower};
+  });
+
+task("protect-cdo", "Add cdo to hypernative pauser module")
+  .addParam('cdo')
+  .setAction(async (args) => {
+    const networkContracts = getNetworkContracts(hre); 
+    const isMatic = hre.network.name == 'matic' || hre.network.config.chainId == 137;
+    const isPolygonZK = hre.network.name == 'polygonzk' || hre.network.config.chainId == 1101;
+    const isOptimism = hre.network.name == 'optimism' || hre.network.config.chainId == 10;
+    const isArbitrum = hre.network.name == 'arbitrum' || hre.network.config.chainId == 42161;
+    const isBase = hre.network.name == 'base' || hre.network.config.chainId == 8453;
+    const isAvax = hre.network.name == 'avax' || hre.network.config.chainId == 43114;
+    const signer = await helpers.getSigner();
+
+    const cdoAddress = args.cdo;
+    if (!cdoAddress) {
+      console.log("🛑 cdo address must be specified");
+      return;
+    }
+
+    // In mainnet
+    if (!(isMatic || isPolygonZK || isOptimism || isArbitrum || isBase || isAvax)) {
+      const pauseModule = new ethers.Contract(networkContracts.hypernativeModule, HypernativeModuleAbi, signer);
+      console.log(`Setting contract to hypernative pauser module ${networkContracts.hypernativeModule}`);
+      const tx = await pauseModule.updateProtectedContracts([{
+        contractAddress: cdoAddress,
+        contractType: 1 // tranche contract
+      }]);
+      await tx.wait();
+      console.log('isContractProtected: ', await pauseModule.isContractProtected(cdoAddress));
+      console.log(`IMPORTANT: manually add contract to watchlists in hypernative module`);
+    }
+
+    if (networkContracts.hypernativePauserEOA) {
+      const pauseModule = await ethers.getContractAt("HypernativeBatchPauser", networkContracts.pauserMultisig, signer);
+      console.log(`Setting contract to hypernative batch pauser ${networkContracts.pauserMultisig}`);
+      const tx = await pauseModule.addProtectedContracts([cdoAddress]);
+      await tx.wait();
+
+      // This contract do not have `isContractProtected` method so we try to get first 20 protected contracts
+      // if it reverts it means that we reached the end of the list, the last contract should be the idleCDO
+      // that we just deployed
+      let contractProtected;
+      for (let i = 0; i < 20; i++) {
+        try {
+          contractProtected = await pauseModule.protectedContracts(i);
+        } catch (error) {
+          // This should be the contract we just added
+          contractProtected = await pauseModule.protectedContracts(i - 1);
+          break;
+        }
+      }
+
+      console.log('isContractProtected: ', contractProtected.toLowerCase() == cdoAddress.toLowerCase());
+      console.log(`IMPORTANT: manually add contract to watchlists in hypernative module`);
+    }
+  });
+
+task("watch-and-protect-cdo", "Add cdo to Hypernative watchlists and custom agents, then protect it")
+  .addParam('cdo')
+  .addParam('name')
+  .addOptionalParam('chainid', 'Chain id used to pick Hypernative watchlists and params')
+  .addOptionalParam('aaTranche', 'AA tranche address for a newly deployed, untracked credit vault')
+  .addOptionalParam('underlyingDecimals', 'Underlying decimals for a newly deployed, untracked credit vault')
+  .setAction(async (args, _hre) => {
+    await _hre.run('watch-cdo', args);
+    await _hre.run('protect-cdo', { cdo: args.cdo });
+  });
+
+task("watch-cdo", "Add cdo to hypernative watchlists and Custom agents")
+  .addParam('cdo')
+  .addParam('name')
+  .addOptionalParam('chainid', 'Chain id used to pick Hypernative watchlists and params')
+  .addOptionalParam('aaTranche', 'AA tranche address for a newly deployed, untracked credit vault')
+  .addOptionalParam('underlyingDecimals', 'Underlying decimals for a newly deployed, untracked credit vault')
+  .setAction(async (args) => {
+    const clientId = process.env.HYPERNATIVE_CLIENT_ID;
+    const clientSecret = process.env.HYPERNATIVE_CLIENT_SECRET;
+    if (!clientId || !clientSecret) {
+      console.log('🛑 HYPERNATIVE_CLIENT_ID and HYPERNATIVE_CLIENT_SECRET env vars must be set');
+      return;
+    }
+    if (!args.cdo || !args.name) {
+      console.log('🛑 cdo and name params must be set');
+      return;
+    }
+
+    console.log('args.chainid ', args.chainid);
+    console.log('hre.network.config.chainId ', hre.network.config);
+    const resolvedChainId = args.chainid ? Number(args.chainid) : await getRuntimeChainId(hre);
+    if (args.chainid && Number.isNaN(resolvedChainId)) {
+      console.log(`🛑 Invalid chainid ${args.chainid}`);
+      return;
+    }
+    const chainId = resolvedChainId || 1;
+    const chainConfig = getHypernativeChainConfig(chainId);
+    if (!chainConfig) {
+      console.log(`⚠️ No preset Hypernative config found for chain ${chainId}, falling back to default params`);
+    }
+    const chainLabel = chainConfig?.label || `chain ${chainId}`;
+    const chainSlug = chainConfig?.chain || 'ethereum';
+    const notePrefix = chainConfig?.notePrefix || `[${chainLabel.toUpperCase()}] credit `;
+    const tagListId = chainConfig?.tagListId || DEFAULT_HYPERNATIVE_TAG_LIST_ID;
+    const effectiveChainConfig = chainConfig || { label: chainLabel, chain: chainSlug, notePrefix };
+    const watchlistsFromConfig = chainConfig
+      ? [...(chainConfig.watchlists || []), ...HYPERNATIVE_GLOBAL_WATCHLISTS]
+      : [];
+    
+      console.log({
+        chainId,
+        chainLabel,
+        chainSlug,
+        notePrefix,
+        tagListId,
+        watchlistsFromConfig,
+      })
+    const normalizeWatchlists = (lists) => {
+      const seen = new Set();
+      return lists.reduce((acc, entry) => {
+        if (!entry || !entry.id || seen.has(entry.id)) {
+          return acc;
+        }
+        seen.add(entry.id);
+        acc.push(entry);
+        return acc;
+      }, []);
+    };
+
+    const watchlists = normalizeWatchlists(watchlistsFromConfig);
+    if (!watchlists.length) {
+      console.log(`🛑 No Hypernative watchlists configured for ${chainLabel}. Update hypernativeChainConfigs.`);
+      return;
+    }
+    console.log(`Adding CDO ${args.cdo} (${args.name}) to Hypernative watchlists for ${chainLabel} (chainId ${chainId})`);
+
+    try {
+      for (const { id, description } of watchlists) {
+        await hypernativeFetch({
+          clientId,
+          clientSecret,
+          method: 'PATCH',
+          path: `/watchlists/${id}`,
+          body: {
+            assets: [{ chain: chainSlug, type: "Contract", address: args.cdo }],
+            mode: 'add'
+          }
+        });
+        console.log(`Added CDO to watchlist ${id}${description ? ` (${description})` : ''}`);
+      }
+
+      // Update hypernative tag for the cdo
+      await hypernativeFetch({
+        clientId,
+        clientSecret,
+        method: 'PATCH',
+        path: `/lists/${tagListId}`,
+        body: {
+          assets: [{
+            chain: chainSlug,
+            note: `${notePrefix}${args.name}`,
+            address: args.cdo,
+          }],
+          mode: 'add'
+        }
+      });
+      console.log(`Updated Hypernative tag ${notePrefix}${args.name}`);
+
+      const trackedCdo = getTrackedCreditVault(hre, args.cdo);
+      const { aaTranche, underlyingDecimals } = resolveHypernativeCreditVaultMetadata(
+        trackedCdo,
+        args.aaTranche,
+        args.underlyingDecimals
+      );
+      const agentPrefix = notePrefix.replace(/ credit $/, '');
+      const customAgents = [
+        { templateId: HYPERNATIVE_CONTRACT_VALUE_TEMPLATE_AGENT_ID, agentName: `${agentPrefix} TVL change credit ${args.name}`, input: [] },
+        ...(aaTranche ? [{ templateId: HYPERNATIVE_AA_VIRTUAL_PRICE_TEMPLATE_AGENT_ID, agentName: `${agentPrefix} Price alert Credit ${args.name} AA`, input: [aaTranche] }] : []),
+      ];
+      if (!aaTranche) {
+        console.log('⚠️ AA tranche not found; skipping Hypernative AA virtualPrice custom agent');
+      }
+      for (const agent of customAgents) {
+        const template = await hypernativeFetch({ clientId, clientSecret, path: `/custom-agents/${agent.templateId}` });
+        const payload = buildHypernativeCustomAgentPayload({
+          agentName: agent.agentName,
+          cdoAddress: args.cdo,
+          chainConfig: effectiveChainConfig,
+          input: agent.input,
+          template,
+          underlyingDecimals,
+        });
+        const createdAgent = await hypernativeFetch({ clientId, clientSecret, method: 'POST', path: '/custom-agents', body: payload });
+        console.log(`Created Hypernative custom agent ${payload.agentName}${createdAgent?.id ? ` (${createdAgent.id})` : ''}`);
+      }
+    } catch (error) {
+      console.log('Error adding CDO to Hypernative', error.message);
+    }
+  });
+
+/**
+ * @name deploy-with-factory-params
+ * task to deploy CDO with strategy, staking rewards via factory with all params from utils/addresses.js
+ */
+task("deploy-with-factory-params", "Deploy IdleCDO with a new strategy and optionally staking rewards via CDOFactory")
+  .addParam('cdoname')
+  .addOptionalParam('proxyAdmin', 'ProxyAdmin address override', '', types.string)
+  .setAction(async (args) => {
+    // Run compile task
+    await run("compile");
+    // Check that cdoname is passed
+    if (!args.cdoname) {
+      console.log("🛑 cdoname and it's params must be defined");
+      return;
+    }
+    
+    const networkTokens = getDeployTokens(hre);
+
+    // Get config params
+    const deployToken = networkTokens[args.cdoname];
+    if (deployToken === undefined) {
+      console.log(`🛑 deployToken not found with specified cdoname (${args.cdoname})`)
+      return;
+    }
+    
+    // Check that args has strategyName and strategyParams
+    if (!deployToken.strategyName || !deployToken.strategyParams) {
+      console.log("🛑 strategyName and strategyParams must be specified");
+      return;
+    }
+    // Get signer
+    const signer = await helpers.getSigner();
+    const addr = await signer.getAddress();
+    const cdoConfig = getNetworkCDOs(hre)[args.cdoname] || {};
+
+    console.log(`Deploying with ${addr}`);
+    console.log()
+
+    // Replace owner as last param
+    const params = deployToken.strategyParams.map(
+      p => p === 'owner' ? addr : p
+    );  
+
+    if (!helpers.isEmptyString(args.proxyAdmin)) {
+      console.log("ProxyAdmin override:     ", args.proxyAdmin);
+    }
+
+    let strategy;
+    if (hasAddress(cdoConfig.strategy)) {
+      console.log("Using existing Strategy: ", cdoConfig.strategy);
+      strategy = await ethers.getContractAt(deployToken.strategyName, cdoConfig.strategy, signer);
+    } else {
+      console.log("Deploying Strategy:      ", deployToken.strategyName);
+      console.log("Strategy params:         ", JSON.stringify(params));
+      console.log()
+
+      strategy = await helpers.deployUpgradableContract(
+        deployToken.strategyName, 
+        params,
+        signer,
+        args.proxyAdmin
+      );
+    }
+    
+    // Deploy IdleCDO with new strategy
+    await hre.run("deploy-with-factory", {
+      cdoname: args.cdoname,
+      cdoVariant: deployToken.cdoVariant,
+      proxyCdoAddress: deployToken.proxyCdoAddress,
+      strategyAddress: strategy.address,
+      strategyName: deployToken.strategyName,
+      aaStaking: deployToken.AAStaking,
+      bbStaking: deployToken.BBStaking,
+      stkAAVEActive: deployToken.stkAAVEActive,
+      limit: deployToken.limit,
+      aaRatio: deployToken.AARatio,
+      isAYSActive: deployToken.isAYSActive,
+      proxyAdmin: args.proxyAdmin,
+    });
+});
+
+/**
+ * @name deploy-cv-with-factory
+ * task to deploy CDO with strategy, staking rewards via factory with all params from utils/addresses.js
+ * This can be used only for standard credit vaults (IdleCDOEpochVariant) and standard strategies (IdleCreditVault)
+ */
+task("deploy-cv-with-factory", "Deploy IdleCDOEpochVariant with associated strategy")
+  .addParam('cdoname')
+  .addParam('copyname')
+  .addOptionalParam('skipverification', 'Skip Etherscan verification', false, types.boolean)
+  .setAction(async (args) => {
+    // Run compile task
+    await run("compile");
+    const shouldVerify = !args.skipverification;
+    // Check that cdoname is passed
+    if (!args.cdoname || !args.copyname) {
+      console.log("🛑 cdoname and copyname must be defined");
+      return;
+    }
+    
+    // Get config params
+    const networkTokens = getDeployTokens(hre);
+    const networkContracts = getNetworkContracts(hre);
+    const networkCDOs = getNetworkCDOs(hre);
+    const deployToken = networkTokens[args.cdoname];
+    if (deployToken.programmableBorrower) {
+      console.log("Programmable borrower config detected, using revolving deployment path");
+      return run("deploy-revolving-cv-with-factory", args);
+    }
+    const copyToken = networkCDOs[args.copyname];
+    const addr0 = '0x0000000000000000000000000000000000000000';
+
+    // Check that args has strategyName and strategyParams
+    if (!deployToken.strategyParams) {
+      console.log("🛑 strategyParams must be specified");
+      return;
+    }
+
+    // Get signer
+    const signer = await helpers.getSigner();
+    // const signer = await helpers.getSigner("0xE5Dab8208c1F4cce15883348B72086dBace3e64B");
+    const addr = await signer.getAddress();
+    console.log(`Deploying with ${addr}`);
+    console.log()
+
+    const factoryAddr = networkContracts.creditVaultFactoryV3;
+
+    console.log("Copy CDO:                ", copyToken.cdoAddr);
+    console.log("Copy Strategy:           ", copyToken.strategy);
+    console.log("Factory:                 ", factoryAddr);
+    
+    // Keep the legacy strategyParams shape; the factory ignores the owner slot.
+    const params = deployToken.strategyParams.map(
+      p => p === 'owner' ? addr : p
+    );
+
+    const apr = params[params.length - 1];
+    console.log('APR:                     ', apr.toString());
+
+    const strategyData = {
+      implementation: await getImplementationAddress(hre.ethers.provider, copyToken.strategy),
+      manager: params[2],
+      borrower: params[3],
+      borrowerName: params[4]
+    };
+
+    console.log('Strategy data for IdleCDOEpochVariant:');
+    console.log("Strategy implementation: ", strategyData.implementation);
+    console.log("Strategy params:         ", params);
+    console.log()
+    const hypernative = deployToken.hypernative;
+    console.log("Hypernative:             ", hypernative);
+
+    const epochDuration = deployToken.epochDuration || 604800; // default 7 day
+    const bufferPeriod = deployToken.bufferPeriod || 43200; // default 12 hour
+    console.log(`Setting epoch duration to ${epochDuration}, buffer period to ${bufferPeriod}`);
+    const instantWithdrawDelay = deployToken.instantWithdrawDelay || 3600; // default 1 hour
+    const instantWithdrawAprDelta = deployToken.instantWithdrawAprDelta || BN(1e18); // default 0
+    const disableInstantWithdraw = deployToken.disableInstantWithdraw || false; // default false
+    console.log(`Setting instant withdraw params disable: ${disableInstantWithdraw}, instant delay: ${instantWithdrawDelay}, instant apr delta ${instantWithdrawAprDelta}`);
+    const owner = networkContracts.treasuryMultisig;
+    const { params: ancillaryParams } = await buildCreditVaultAncillaryParams({
+      deployToken,
+      copyToken,
+      networkContracts,
+    });
+    const keyringPolicy = deployToken.keyringPolicy || '0';
+    console.log(`Setting keyring policy ${keyringPolicy}`);
+    const fees = getCreditVaultFactoryFee(deployToken);
+    const feeReceiver = getCreditVaultFeeReceiver(deployToken, owner);
+    const managementFee = getCreditVaultManagementFee(deployToken);
+    validateCreditVaultMinimumFees(fees, managementFee);
+    console.log(`Has queue: ${deployToken.queue}`);
+    console.log()
+
+    console.log('Is interest minted: ', !!deployToken.interestMinted);
+    console.log('Is deposit during epoch disabled: ', !deployToken.depositDuringEpoch);
+    console.log();
+
+    const factory = await ethers.getContractAt("IdleCreditVaultFactory", factoryAddr, signer);
+    const factoryFeeSplit = await factory.feeSplit();
+    const factoryProxyAdmin = await factory.proxyAdmin();
+    console.log("Factory proxy admin:      ", factoryProxyAdmin);
+    console.log(`Setting fees ${fees} to ${feeReceiver} with factory split ${factoryFeeSplit}; owner receives the remainder`);
+    console.log(`Setting management fee ${managementFee}`);
+    console.log('Owner of all contracts: ', owner);
+    console.log(`Deploying contracts via factory at ${factoryAddr}`);
+    const creditVaultPostInitParams = {
+      implementation: await getImplementationAddress(hre.ethers.provider, copyToken.cdoAddr),
+      limit: BN(deployToken.limit).mul(ONE_TOKEN(deployToken.decimals)),
+      underlying: deployToken.underlying,
+      apr,
+      epochDuration,
+      bufferPeriod,
+      instantWithdrawDelay,
+      instantWithdrawAprDelta,
+      disableInstantWithdraw,
+      keyringPolicy,
+      feeReceiver,
+      fees,
+      managementFee,
+      isInterestMinted: !!deployToken.interestMinted,
+      isDepositDuringEpochDisabled: !deployToken.depositDuringEpoch
+    }
+    console.log("Credit Vault params:     ", creditVaultPostInitParams);
+    const tx = await factory.connect(signer).deployCreditVault(
+      creditVaultPostInitParams,
+      strategyData,
+      ancillaryParams
+    );
+    const receipt = await tx.wait();
+
+    const deploymentEvent = receipt.events.find(e => e.event === "CreditVaultDeployed");
+    const [cv, strategy, queue, , keyringWhitelist, writeOffEscrow] = deploymentEvent.args;
+    console.log('Credit Vault deployed at  ', cv);
+    console.log('Strategy deployed at      ', strategy);
+
+    if (shouldVerify) {
+      await hre.run("verify-contract", { address: cv });
+      await hre.run("verify-contract", { address: strategy });
+    }
+
+    if (deployToken.queue) {
+      console.log('Queue deployed at         ', queue);
+      if (shouldVerify) {
+        await hre.run("verify-contract", { address: queue });
+      }
+    }
+    if (keyringWhitelist !== addr0) {
+      console.log('Keyring whitelist deployed at', keyringWhitelist);
+    }
+
+    if (hypernative) {
+      console.log('Adding Credit Vault to hypernative pauser module');
+      const strategyContract = await ethers.getContractAt("IdleCreditVault", strategy, signer);
+      const cdoContract = await ethers.getContractAt("IdleCDOEpochVariant", cv, signer);
+      const name = await strategyContract.symbol();
+      const aaTranche = await cdoContract.AATranche();
+      await hre.run("protect-cdo", { cdo: cv });
+      await hre.run("watch-cdo", {
+        cdo: cv,
+        name,
+        aaTranche,
+        underlyingDecimals: deployToken.decimals.toString(),
+      });
+    }
+
+    if (deployToken.writeoff && writeOffEscrow !== addr0) {
+      console.log('Write off escrow deployed at', writeOffEscrow);
+      if (shouldVerify) {
+        await hre.run("verify-contract", { address: writeOffEscrow });
+      }
+    }
+
+    await hre.run("print-contracts-info", {
+      cdo: cv,
+      strategy,
+      queue: hasAddress(queue) ? queue : undefined,
+      writeoff: hasAddress(writeOffEscrow) ? writeOffEscrow : undefined
+    });
+});
+
+/**
+ * @name deploy-revolving-cv-with-factory
+ * task to deploy a programmable-borrower credit vault via the shared factory
+ */
+task("deploy-revolving-cv-with-factory", "Deploy IdleCDOEpochVariant with IdleCreditVault and ProgrammableBorrower")
+  .addParam('cdoname')
+  .addParam('copyname')
+  .addOptionalParam('skipverification', 'Skip Etherscan verification', false, types.boolean)
+  .setAction(async (args) => {
+    await run("compile");
+    const shouldVerify = !args.skipverification;
+    if (!args.cdoname || !args.copyname) {
+      console.log("🛑 cdoname and copyname must be defined");
+      return;
+    }
+
+    const networkTokens = getDeployTokens(hre);
+    const networkContracts = getNetworkContracts(hre);
+    const networkCDOs = getNetworkCDOs(hre);
+    const deployToken = networkTokens[args.cdoname];
+    const copyToken = networkCDOs[args.copyname];
+    const programmableBorrowerConfig = getProgrammableBorrowerConfig(deployToken);
+
+    if (!deployToken.strategyParams || !programmableBorrowerConfig) {
+      console.log("🛑 strategyParams and programmableBorrower config must be specified");
+      return;
+    }
+
+    const signer = await helpers.getSigner();
+    const addr = await signer.getAddress();
+    console.log(`Deploying with ${addr}`);
+    console.log()
+
+    const factoryAddr = networkContracts.creditVaultFactoryV3;
+    console.log("Copy CDO:                ", copyToken.cdoAddr);
+    console.log("Copy Strategy:           ", copyToken.strategy);
+    console.log("Factory:                 ", factoryAddr);
+
+    const params = deployToken.strategyParams.map(
+      p => p === 'owner' ? addr : p
+    );
+    if (!params[3]) {
+      params[3] = addr0;
+    }
+    params[params.length - 1] = BN(0);
+
+    if (
+      !programmableBorrowerConfig.vault ||
+      programmableBorrowerConfig.vault === addr0 ||
+      !programmableBorrowerConfig.borrower ||
+      programmableBorrowerConfig.borrower === addr0 ||
+      programmableBorrowerConfig.borrowerApr === undefined ||
+      programmableBorrowerConfig.borrowerApr === ""
+    ) {
+      console.log("🛑 programmable borrower config incomplete");
+      console.log("Provide:");
+      console.log("  programmableBorrower: { vault, borrower, borrowerApr, implementation? }");
+      return;
+    }
+    if (programmableBorrowerConfig.manager) {
+      params[2] = programmableBorrowerConfig.manager;
+    }
+
+    const strategyData = {
+      implementation: await getImplementationAddress(hre.ethers.provider, copyToken.strategy),
+      manager: params[2],
+      borrower: params[3],
+      borrowerName: params[4]
+    };
+
+    console.log('Strategy data for IdleCDOEpochVariant:');
+    console.log("Strategy implementation: ", strategyData.implementation);
+    console.log("Strategy params:         ", params);
+    console.log()
+
+    const hypernative = deployToken.hypernative;
+    console.log("Hypernative:             ", hypernative);
+
+    const epochDuration = deployToken.epochDuration || 604800;
+    const bufferPeriod = deployToken.bufferPeriod || 43200;
+    console.log(`Setting epoch duration to ${epochDuration}, buffer period to ${bufferPeriod}`);
+    const instantWithdrawDelay = deployToken.instantWithdrawDelay || 3600;
+    const instantWithdrawAprDelta = deployToken.instantWithdrawAprDelta || BN(1e18);
+    if (deployToken.disableInstantWithdraw === false) {
+      console.log("Programmable borrower mode forces disableInstantWithdraw to true");
+    }
+    const disableInstantWithdraw = true;
+    console.log(`Setting instant withdraw params disable: ${disableInstantWithdraw}, instant delay: ${instantWithdrawDelay}, instant apr delta ${instantWithdrawAprDelta}`);
+    if (deployToken.depositDuringEpoch) {
+      console.log("Programmable borrower mode forces deposit during epoch disabled");
+    }
+    const isDepositDuringEpochDisabled = true;
+
+    const owner = networkContracts.treasuryMultisig;
+    const { params: ancillaryParams } = await buildCreditVaultAncillaryParams({
+      deployToken,
+      copyToken,
+      networkContracts,
+      includeWriteOff: false,
+    });
+    const keyringPolicy = deployToken.keyringPolicy || '0';
+    console.log(`Setting keyring policy ${keyringPolicy}`);
+
+    const fees = getCreditVaultFactoryFee(deployToken);
+    const feeReceiver = getCreditVaultFeeReceiver(deployToken, owner);
+    const managementFee = getCreditVaultManagementFee(deployToken);
+    validateCreditVaultMinimumFees(fees, managementFee);
+    console.log(`Has queue: ${deployToken.queue}`);
+    console.log()
+
+    let programmableBorrowerImplementation = programmableBorrowerConfig.implementation;
+    let deployedProgrammableBorrowerImplementation = false;
+    if (!programmableBorrowerImplementation) {
+      console.log('Deploying ProgrammableBorrower implementation');
+      const programmableBorrowerImpl = await helpers.deployContract('ProgrammableBorrower', [], signer);
+      programmableBorrowerImplementation = programmableBorrowerImpl.address;
+      deployedProgrammableBorrowerImplementation = true;
+    }
+    console.log("ProgrammableBorrower implementation:", programmableBorrowerImplementation);
+    console.log("ProgrammableBorrower vault:         ", programmableBorrowerConfig.vault);
+    console.log("ProgrammableBorrower borrower:      ", programmableBorrowerConfig.borrower);
+    console.log("ProgrammableBorrower manager:       ", params[2]);
+    console.log("ProgrammableBorrower APR:           ", programmableBorrowerConfig.borrowerApr);
+    console.log()
+
+    const factory = await ethers.getContractAt("IdleCreditVaultFactory", factoryAddr, signer);
+    const factoryFeeSplit = await factory.feeSplit();
+    const factoryProxyAdmin = await factory.proxyAdmin();
+    console.log("Factory proxy admin:      ", factoryProxyAdmin);
+    console.log(`Setting fees ${fees} to ${feeReceiver} with factory split ${factoryFeeSplit}; owner receives the remainder`);
+    console.log(`Setting management fee ${managementFee}`);
+    console.log('Owner of all contracts: ', owner);
+    console.log(`Deploying revolving credit vault via factory at ${factoryAddr}`);
+
+    const creditVaultPostInitParams = {
+      implementation: await getImplementationAddress(hre.ethers.provider, copyToken.cdoAddr),
+      limit: BN(deployToken.limit).mul(ONE_TOKEN(deployToken.decimals)),
+      underlying: deployToken.underlying,
+      apr: BN(0),
+      epochDuration,
+      bufferPeriod,
+      instantWithdrawDelay,
+      instantWithdrawAprDelta,
+      disableInstantWithdraw,
+      keyringPolicy,
+      feeReceiver,
+      fees,
+      managementFee,
+      isInterestMinted: true,
+      isDepositDuringEpochDisabled
+    };
+    console.log("Credit Vault params:     ", creditVaultPostInitParams);
+    const programmableBorrowerParams = {
+      implementation: programmableBorrowerImplementation,
+      vault: programmableBorrowerConfig.vault,
+      borrower: programmableBorrowerConfig.borrower,
+      borrowerApr: programmableBorrowerConfig.borrowerApr
+    };
+
+    const tx = await factory.connect(signer).deployRevolvingCreditVault(
+      creditVaultPostInitParams,
+      strategyData,
+      programmableBorrowerParams,
+      ancillaryParams
+    );
+    const receipt = await tx.wait();
+
+    const deploymentEvent = receipt.events.find(e => e.event === "CreditVaultDeployed");
+    const [cv, strategy, queue, programmableBorrower, keyringWhitelist] = deploymentEvent.args;
+    console.log('Credit Vault deployed at      ', cv);
+    console.log('Strategy deployed at          ', strategy);
+    console.log('ProgrammableBorrower at       ', programmableBorrower);
+
+    if (shouldVerify) {
+      await hre.run("verify-contract", { address: cv });
+      await hre.run("verify-contract", { address: strategy });
+      await hre.run("verify-contract", { address: programmableBorrower });
+      if (deployedProgrammableBorrowerImplementation) {
+        await run("verify:verify", {
+          constructorArguments: [],
+          address: programmableBorrowerImplementation,
+          contract: "contracts/strategies/idle/ProgrammableBorrower.sol:ProgrammableBorrower"
+        });
+      }
+    }
+
+    if (deployToken.queue) {
+      console.log('Queue deployed at             ', queue);
+      if (shouldVerify) {
+        await hre.run("verify-contract", { address: queue });
+      }
+    }
+    if (keyringWhitelist !== addr0) {
+      console.log('Keyring whitelist deployed at ', keyringWhitelist);
+    }
+
+    if (hypernative) {
+      console.log('Adding Credit Vault to hypernative pauser module');
+      const strategyContract = await ethers.getContractAt("IdleCreditVault", strategy, signer);
+      const cdoContract = await ethers.getContractAt("IdleCDOEpochVariant", cv, signer);
+      const name = await strategyContract.symbol();
+      const aaTranche = await cdoContract.AATranche();
+      await hre.run("protect-cdo", { cdo: cv });
+      await hre.run("watch-cdo", {
+        cdo: cv,
+        name,
+        aaTranche,
+        underlyingDecimals: deployToken.decimals.toString(),
+      });
+    }
+
+    await hre.run("print-contracts-info", { cdo: cv, strategy, queue: hasAddress(queue) ? queue : undefined });
+  });
+
+/**
+ * @name upgrade-credit-vault-blueprint
+ * task to upgrade selected proxies used as the credit vault factory blueprint
+ */
+task("upgrade-credit-vault-blueprint", "Upgrade selected credit vault blueprint implementations")
+  .addOptionalParam('cdoname', 'Blueprint CDO key from utils/addresses.js', DEFAULT_CREDIT_VAULT_BLUEPRINT)
+  .addOptionalParam('components', 'Comma-separated components: cdo,strategy,queue,revolving,writeoff', CREDIT_VAULT_BLUEPRINT_COMPONENT_ORDER.join(','))
+  .setAction(async (args, _hre) => {
+    await _hre.run("compile");
+
+    const networkCDOs = getNetworkCDOs(_hre);
+    const blueprint = networkCDOs[args.cdoname];
+    if (!blueprint) {
+      throw new Error(`Blueprint ${args.cdoname} not found for network ${_hre.network.name}`);
+    }
+
+    const components = getCreditVaultBlueprintUpgradeComponents(args.components);
+    await assertCreditVaultUpgradeReady(_hre, blueprint, components, args.cdoname);
+    const targets = getCreditVaultBlueprintUpgradeTargets(blueprint, components);
+    if (targets.length === 0) {
+      throw new Error(`Blueprint ${args.cdoname} has no upgradeable proxies configured for components ${components.join(',')}`);
+    }
+
+    const signer = await helpers.getSigner();
+    const signerAddress = await signer.getAddress();
+    const signerCode = await _hre.ethers.provider.getCode(signerAddress);
+    if (signerCode !== '0x') {
+      throw new Error(`Signer ${signerAddress} is not an EOA`);
+    }
+
+    const proxyAdminAddress = blueprint.proxyAdmin;
+    if (!hasAddress(proxyAdminAddress)) {
+      throw new Error(`Blueprint ${args.cdoname} must define proxyAdmin in utils/addresses.js`);
+    }
+
+    const proxyAdminCode = await _hre.ethers.provider.getCode(proxyAdminAddress);
+    if (proxyAdminCode === '0x') {
+      throw new Error(`No ProxyAdmin contract found at ${proxyAdminAddress}`);
+    }
+
+    const proxyAdmin = await _hre.ethers.getContractAt("ProxyAdmin", proxyAdminAddress, signer);
+    const proxyAdminOwner = await proxyAdmin.owner();
+    if (!sameAddress(proxyAdminOwner, signerAddress)) {
+      throw new Error(`Signer ${signerAddress} is not ProxyAdmin owner ${proxyAdminOwner}`);
+    }
+
+    console.log(`Upgrading blueprint ${args.cdoname} with ${signerAddress}`);
+    console.log(`ProxyAdmin: ${proxyAdminAddress}`);
+    console.log(`Components: ${components.join(', ')}`);
+    console.log();
+
+    for (const target of targets) {
+      const currentAdmin = await getAdminAddress(_hre.ethers.provider, target.proxy);
+      if (!sameAddress(currentAdmin, proxyAdminAddress)) {
+        throw new Error(`${target.label} proxy admin ${currentAdmin} does not match ${proxyAdminAddress}`);
+      }
+
+      const currentImplementation = await getImplementationAddress(_hre.ethers.provider, target.proxy);
+      const contractFactory = await _hre.ethers.getContractFactory(target.contractName, signer);
+
+      // Register only the implementation layout. Importing the blueprint proxy would warn
+      // because it intentionally uses an EOA ProxyAdmin instead of the main manifest admin.
+      await _hre.upgrades.forceImport(currentImplementation, contractFactory);
+      const newImplementation = await _hre.upgrades.prepareUpgrade(target.proxy, contractFactory, {
+        kind: 'transparent',
+        redeployImplementation: 'always',
+      });
+
+      console.log(`${target.label}`);
+      console.log(`  Proxy:          ${target.proxy}`);
+      console.log(`  Current impl:   ${currentImplementation}`);
+      console.log(`  New impl:       ${newImplementation}`);
+
+      const tx = await proxyAdmin.upgrade(target.proxy, newImplementation);
+      const receipt = await tx.wait();
+      console.log(`  Upgrade tx:     ${receipt.transactionHash}`);
+
+      try {
+        await _hre.run("verify:verify", {
+          constructorArguments: [],
+          address: newImplementation,
+          contract: target.contractName
+        });
+        console.log(`  Verified:       ${newImplementation}`);
+      } catch (error) {
+        console.log(`  Verification failed for ${newImplementation}: ${error.message}`);
+      }
+      console.log();
+    }
+  });
+
+task("print-cv-addresses-from-tx", "Print addresses.js CDO entry from a credit vault factory deployment transaction")
+  .addParam('txhash', 'Credit vault factory deployment transaction hash')
+  .setAction(async (args, _hre) => {
+    const receipt = await _hre.ethers.provider.getTransactionReceipt(args.txhash);
+    if (!receipt) {
+      throw new Error(`Transaction receipt not found for ${args.txhash}`);
+    }
+
+    const deployment = parseCreditVaultDeploymentReceipt(receipt);
+    const entry = await buildCreditVaultAddressesEntryFromDeployment(_hre, deployment);
+    console.log(formatCreditVaultAddressesEntry(_hre, entry));
+  });
+
+task("print-contracts-info", "Prints deployed contracts info")
+  .addOptionalParam('name', 'Credit vault name from utils/addresses.js')
+  .addOptionalParam('cdo', 'Cdo address')
+  .addOptionalParam('strategy', 'Strategy address')
+  .addOptionalParam('queue', 'Queue address')
+  .addOptionalParam('writeoff', 'Write-off escrow address')
+  .addOptionalParam('orchestrator', 'Credit vault manager orchestrator address')
+  .setAction(async (args) => {
+    console.log('Printing contracts info');
+    const resolvedAddresses = resolvePrintContractsInfoAddresses(hre, args);
+    const queueAddress = resolvedAddresses.queue;
+    const writeOffAddress = resolvedAddresses.writeoff;
+    const orchestratorAddress = resolvedAddresses.orchestrator;
+    const cdo = resolvedAddresses.cdo ? await ethers.getContractAt("IdleCDOEpochVariant", resolvedAddresses.cdo) : null;
+    const strategy = resolvedAddresses.strategy ? await ethers.getContractAt("IdleCreditVault", resolvedAddresses.strategy) : null;
+    const queue = queueAddress ? await ethers.getContractAt("IdleCDOEpochQueue", queueAddress) : null;
+    const writeOffEscrow = writeOffAddress ? await ethers.getContractAt("IdleCreditVaultWriteOffEscrow", writeOffAddress) : null;
+    const orchestrator = orchestratorAddress ? await ethers.getContractAt("IdleCreditVaultManagerOrchestrator", orchestratorAddress) : null;
+    let cdoPrefundedQueue = null;
+    if (cdo) {
+      const [
+        owner,
+        guardian,
+        aaTrancheData,
+        bbTrancheData,
+        underlyingData,
+        strategyAddress,
+        feeReceiver,
+        epochDuration,
+        bufferPeriod,
+        feeValue,
+        feeSplit,
+        managementFee,
+        instantDisabled,
+        aprDelta,
+        instantDelay,
+        keyringData,
+        keyringPolicy,
+        cdoFlags,
+        prefundedQueue,
+      ] = await Promise.all([
+        cdo.owner(),
+        getPrintContractsInfoGuardian(hre, cdo.address),
+        (async () => {
+          const address = await cdo.AATranche();
+          const tranche = await ethers.getContractAt("IERC20Detailed", address);
+          const [name, symbol] = await Promise.all([tranche.name(), tranche.symbol()]);
+          return { address, name, symbol };
+        })(),
+        (async () => {
+          const address = await cdo.BBTranche();
+          const tranche = await ethers.getContractAt("IERC20Detailed", address);
+          const [name, symbol] = await Promise.all([tranche.name(), tranche.symbol()]);
+          return { address, name, symbol };
+        })(),
+        (async () => {
+          const address = await cdo.token();
+          const tokenContract = await ethers.getContractAt("IERC20Detailed", address);
+          const [name, decimals] = await Promise.all([tokenContract.name(), tokenContract.decimals()]);
+          return { address, name, decimals };
+        })(),
+        cdo.strategy(),
+        cdo.feeReceiver(),
+        cdo.epochDuration(),
+        cdo.bufferPeriod(),
+        cdo.fee(),
+        cdo.feeSplit(),
+        cdo.managementFee(),
+        cdo.disableInstantWithdraw(),
+        cdo.instantWithdrawAprDelta(),
+        cdo.instantWithdrawDelay(),
+        (async () => {
+          const address = await cdo.keyring();
+          if (!hasAddress(address)) return { address, admin: null };
+          const whitelist = await ethers.getContractAt("KeyringIdleWhitelist", address);
+          return { address, admin: await whitelist.admin() };
+        })(),
+        cdo.keyringPolicyId(),
+        getPrintContractsInfoCdoFlags(cdo),
+        (async () => {
+          try {
+            const prefundedCdo = await ethers.getContractAt(
+              'contracts/IdleCDOEpochVariantPrefunded.sol:IdleCDOEpochVariantPrefunded',
+              cdo.address
+            );
+            return await prefundedCdo.epochQueue();
+          } catch (error) {
+            return null;
+          }
+        })(),
+      ]);
+      cdoPrefundedQueue = prefundedQueue;
+      const feeAllocation = getPrintContractsInfoFeeAllocation(feeSplit);
+      console.log(`CDO at ${cdo.address}`);
+      console.log(`  Owner:          ${owner}`);
+      console.log(`  Guardian:       ${guardian}`);
+      console.log(`  Underlying:     ${underlyingData.address} (${underlyingData.name} ${underlyingData.decimals} decimals)`);
+      console.log(`  AATranche:      ${aaTrancheData.address}`);
+      console.log(`       Name:      ${aaTrancheData.name}`);
+      console.log(`       Symbol:    ${aaTrancheData.symbol}`);
+      console.log(`  BBTranche:      ${bbTrancheData.address}`);
+      console.log(`       Name:      ${bbTrancheData.name}`);
+      console.log(`       Symbol:    ${bbTrancheData.symbol}`);
+      console.log(`  Strategy:       ${strategyAddress}`);
+      console.log(`  FeeReceiver:    ${feeReceiver}`);
+      console.log(`  EpochDuration:  ${epochDuration}`);
+      console.log(`  BufferPeriod:   ${bufferPeriod}`);
+      console.log(`  Fees:           ${feeValue}`);
+      console.log(`  FeeSplit:       ${feeSplit}`);
+      console.log(`    FeeReceiver:  ${feeAllocation.feeReceiverShare} (${feeAllocation.feeReceiverPercentage}) -> ${feeReceiver}`);
+      console.log(`    Owner:        ${feeAllocation.ownerShare} (${feeAllocation.ownerPercentage}) -> ${owner}`);
+      console.log(`  ManagementFee:  ${managementFee}`);
+      console.log(`  Instant disable:${instantDisabled}`);
+      console.log(`  APR Delta:      ${aprDelta}`);
+      console.log(`  Instant Delay:  ${instantDelay}`);
+      console.log(`  Keyring Whitelist: ${keyringData.address}`);
+      console.log(`  Keyring Admin:  ${keyringData.admin ?? 'N/A (disabled)'}`);
+      console.log(`  Keyring Policy: ${keyringPolicy}`);
+      console.log(`  isInterestMinted: ${cdoFlags.isInterestMinted}`);
+      console.log(`  isDepositDuringEpochDisabled: ${cdoFlags.isDepositDuringEpochDisabled}`);
+      if (cdoPrefundedQueue !== null) {
+        console.log(`  Prefunded Queue:${cdoPrefundedQueue}`);
+      }
+
+      console.log(``);
+    }
+    if (strategy) {
+      const [
+        owner,
+        underlyingData,
+        tokenDecimals,
+        borrower,
+        manager,
+        whitelistedCdo,
+        apr,
+        unscaledApr,
+        strategyState,
+      ] = await Promise.all([
+        strategy.owner(),
+        (async () => {
+          const address = await strategy.token();
+          const tokenContract = await ethers.getContractAt("IERC20Detailed", address);
+          const [name, decimals] = await Promise.all([tokenContract.name(), tokenContract.decimals()]);
+          return { address, name, decimals };
+        })(),
+        strategy.tokenDecimals(),
+        strategy.borrower(),
+        strategy.manager(),
+        strategy.idleCDO(),
+        strategy.getApr(),
+        strategy.unscaledApr(),
+        getPrintContractsInfoStrategyState(strategy),
+      ]);
+      console.log(`Strategy at ${strategy.address}`);
+      console.log(`  Owner:          ${owner}`);
+      console.log(`  Underlying:     ${underlyingData.address} (${underlyingData.name} ${underlyingData.decimals} decimals)`);
+      console.log(`  Decimals:       ${tokenDecimals}`);
+      console.log(`  Borrower:       ${borrower}`);
+      console.log(`  Manager:        ${manager}`);
+      console.log(`  Whitelisted CDO:${whitelistedCdo}`);
+      console.log(`  APR:            ${apr}`);
+      console.log(`  Unscaled APR:   ${unscaledApr}`);
+      console.log(`  Max APR:        ${strategyState.maxApr}`);
+      console.log(``);
+    }
+    if (orchestrator) {
+      const orchestratorState = await getPrintContractsInfoOrchestratorState(
+        orchestrator,
+        cdo ? cdo.address : resolvedAddresses.cdo
+      );
+      console.log(`Orchestrator at ${orchestrator.address}`);
+      console.log(`  Owner:          ${orchestratorState.owner}`);
+      console.log(`  Operator:       ${orchestratorState.operator}`);
+      if (orchestratorState.isCreditVaultAllowed !== null) {
+        console.log(`  CDO allowed:    ${orchestratorState.isCreditVaultAllowed}`);
+      }
+      console.log(``);
+    }
+    if (queue) {
+      const [owner, epochCdo, underlying, tranche, queueAllowed, prefundedDepositWindow] = await Promise.all([
+        queue.owner(),
+        queue.idleCDOEpoch(),
+        queue.underlying(),
+        queue.tranche(),
+        cdo ? cdo.isWalletAllowed(queue.address) : null,
+        (async () => {
+          try {
+            return await queue.prefundedDepositWindow();
+          } catch (error) {
+            return null;
+          }
+        })(),
+      ]);
+      const isPrefundedQueue = cdoPrefundedQueue !== null &&
+        cdoPrefundedQueue !== addr0 &&
+        normalizeAddress(cdoPrefundedQueue) === normalizeAddress(queue.address);
+      console.log(`Queue at ${queue.address}`);
+      console.log(`  Owner:          ${owner}`);
+      console.log(`  CDO:            ${epochCdo}`);
+      console.log(`  Underlying:     ${underlying}`);
+      console.log(`  Tranche:        ${tranche}`);
+      if (queueAllowed !== null) {
+        console.log(`  Queue allowed:  ${queueAllowed}`);
+      }
+      if (prefundedDepositWindow !== null) {
+        console.log(`  Prefund Window: ${prefundedDepositWindow}`);
+      }
+      if (cdoPrefundedQueue !== null) {
+        console.log(`  Is Prefunded:   ${isPrefundedQueue}`);
+      }
+      console.log(``);
+    }
+    if (writeOffEscrow) {
+      const [owner, epochCdo, strategyAddress, underlying, tranche, borrower, exitFee, feeReceiver] = await Promise.all([
+        writeOffEscrow.owner(),
+        writeOffEscrow.idleCDOEpoch(),
+        writeOffEscrow.strategy(),
+        writeOffEscrow.underlying(),
+        writeOffEscrow.tranche(),
+        writeOffEscrow.borrower(),
+        writeOffEscrow.exitFee(),
+        writeOffEscrow.feeReceiver(),
+      ]);
+      console.log(`WriteOff escrow at ${writeOffEscrow.address}`);
+      console.log(`  Owner:          ${owner}`);
+      console.log(`  CDO:            ${epochCdo}`);
+      console.log(`  Strategy:       ${strategyAddress}`);
+      console.log(`  Underlying:     ${underlying}`);
+      console.log(`  Tranche:        ${tranche}`);
+      console.log(`  Borrower:       ${borrower}`);
+      console.log(`  Exit Fee:       ${exitFee}`);
+      console.log(`  Fee Receiver:   ${feeReceiver}`);
+      console.log(``);
+    }
+  });
+
+task("verify-contract", "Verify contract on Etherscan")
+  .addParam('address', 'Contract address to verify')
+  .setAction(async (args) => {
+    console.log(`Verifying contract at ${args.address}`);
+    try {
+      await run("verify:verify", {
+        address: args.address,
+        constructorArguments: []
+      });
+    } catch (error) {
+      console.error(error);
+    }
+});
+
+/**
+ * @name deploy-queue
+ * task to deploy IdleCDOEpochQueue for a credit vault
+ */
+task("deploy-queue", "Deploy IdleCDOEpochQueue")
+  .addParam('cdo')
+  .addOptionalParam('owner')
+  .addOptionalParam('isaa')
+  .addOptionalParam('keyring')
+  .addOptionalParam('proxyAdmin', 'ProxyAdmin address override', '', types.string)
+  .setAction(async (args) => {
+    // Run compile task
+    await run("compile");
+    // Check that cdo is passed
+    if (!args.cdo) {
+      console.log("🛑 cdo address must be defined");
+      return;
+    }
+
+    // Get signer
+    const signer = await helpers.getSigner();
+    const addr = await signer.getAddress();
+
+    console.log(`Deploying with ${addr}`);
+    console.log()
+
+    const params = [
+      args.cdo, 
+      args.owner || '0xE5Dab8208c1F4cce15883348B72086dBace3e64B', 
+      args.isaa || true
+    ];
+
+    console.log('Params for IdleCDOEpochQueue', params);
+
+    // Deploy queue contract
+    const queue = await helpers.deployUpgradableContract(
+      'IdleCDOEpochQueue',
+      params,
+      signer,
+      args.proxyAdmin
+    );
+
+    if (args.keyring) {
+      console.log(`Adding queue to keyring whitelist (${args.keyring})`);
+      const whitelist = await ethers.getContractAt("KeyringWhitelist", args.keyring, signer);
+      if (await whitelist.whitelist(queue.address)) {
+        console.log('Queue already whitelisted in keyring');
+      } else {
+        await whitelist.connect(signer).setWhitelistStatus(queue.address, true);
+      }
+    }
+
+    return queue.address;
+});
+
+/**
+ * @name deploy-writeoff-escrow
+ * task to deploy IdleCDOEpochQueue for a credit vault
+ */
+task("deploy-writeoff-escrow", "Deploy IdleCreditVaultWriteOffEscrow")
+  .addParam('cdo')
+  .addOptionalParam('owner')
+  .addOptionalParam('isaa')
+  .addOptionalParam('proxyAdmin', 'ProxyAdmin address override', '', types.string)
+  .setAction(async (args) => {
+    // Check that cdo is passed
+    if (!args.cdo) {
+      console.log("🛑 cdo address must be defined");
+      return;
+    }
+
+    const chainId = await getRuntimeChainId(hre);
+    console.log('chainId', chainId);
+    const contractName = getWriteOffEscrowContractName(chainId);
+    if (!contractName) {
+      console.log('contract not available for this network');
+      return;
+    }
+
+    // Run compile task
+    await run("compile");
+
+    // Get signer
+    const signer = await helpers.getSigner();
+    const addr = await signer.getAddress();
+
+    console.log(`Deploying with ${addr}`);
+    console.log()
+
+    const networkContracts = getNetworkContracts(hre);
+    const params = [
+      args.cdo,
+      args.owner || networkContracts.treasuryMultisig,
+      args.isaa || true
+    ];
+
+    console.log(`Params for ${contractName}`, params);
+
+    // Deploy write off escrow contract
+    const writeOffEscrow = await helpers.deployUpgradableContract(
+      contractName,
+      params,
+      signer,
+      args.proxyAdmin
+    );
+    return writeOffEscrow.address;
+  });
+
+/**
+* @name deploy-programmable-borrower
+* task to deploy and configure a ProgrammableBorrower proxy
+*/
+task("deploy-programmable-borrower", "Deploy and configure a ProgrammableBorrower proxy")
+  .addParam('cdo')
+  .addParam('vault')
+  .addParam('manager')
+  .addParam('borrower')
+  .addParam('borrowerapr')
+  .addOptionalParam('proxyAdmin', 'ProxyAdmin address override', '', types.string)
+  .setAction(async (args) => {
+    const signer = await helpers.getSigner();
+    const deployer = await signer.getAddress();
+
+    console.log(`Deploying ProgrammableBorrower with ${deployer}`);
+    console.log()
+
+    const programmableBorrower = await helpers.deployUpgradableContract(
+      'ProgrammableBorrower',
+      [args.vault, args.cdo, deployer, args.manager, args.borrower, args.borrowerapr],
+      signer,
+      args.proxyAdmin
+    );
+
+    return programmableBorrower.address;
+  });
+
+/**
+ * @name deploy-cv-manager-orchestrator
+ * task to deploy IdleCreditVaultManagerOrchestrator
+ */
+task("deploy-cv-manager-orchestrator", "Deploy IdleCreditVaultManagerOrchestrator")
+  .addParam('operator', 'Account allowed to operate the credit vault cluster')
+  .addOptionalParam('proxyAdmin', 'ProxyAdmin address override', '', types.string)
+  .setAction(async (args) => {
+    await run("compile");
+
+    const signer = await helpers.getSigner();
+    const deployer = await signer.getAddress();
+    const networkContracts = getNetworkContracts(hre);
+    const proxyAdmin = args.proxyAdmin || networkContracts.proxyAdminWithTimelock || networkContracts.proxyAdmin;
+
+    console.log(`Deploying IdleCreditVaultManagerOrchestrator with ${deployer}`);
+    console.log(`Operator: ${args.operator}`);
+    console.log(`Owner: ${deployer}`);
+    console.log(`ProxyAdmin: ${proxyAdmin}`);
+    console.log();
+
+    const orchestrator = await helpers.deployUpgradableContract(
+      'IdleCreditVaultManagerOrchestrator',
+      [args.operator],
+      signer,
+      proxyAdmin
+    );
+
+    const implementation = await getImplementationAddress(hre.ethers.provider, orchestrator.address);
+    console.log(`IdleCreditVaultManagerOrchestrator proxy deployed at ${orchestrator.address}`);
+    console.log(`IdleCreditVaultManagerOrchestrator implementation deployed at ${implementation}`);
+    console.log();
+    console.log('Next steps for each credit vault:');
+    console.log(`1. Call setCreditVaultAllowed(cdo, true) on the orchestrator at ${orchestrator.address}`);
+    console.log(`2. Call setManager(${orchestrator.address}) on the credit vault strategy`);
+
+    return orchestrator;
+  });
+
+/**
+ * @name deploy-proxy-admin
+ * task to deploy ProxyAdmin
+ */
+task("deploy-proxy-admin", "Deploy ProxyAdmin")
+  .addOptionalParam('owner')
+  .setAction(async (args) => {
+    // Run compile task
+    await run("compile");
+
+    // Get signer
+    const signer = await helpers.getSigner();
+    const addr = await signer.getAddress();
+
+    console.log(`Deploying ProxyAdmin with ${addr}`);
+    console.log()
+
+    const proxyAdmin = await helpers.deployContract('ProxyAdmin', [], signer);
+
+    if (args.owner) {
+      console.log(`Transferring ownership to ${args.owner}`);
+      await proxyAdmin.transferOwnership(args.owner);
+    }
+});
+
+/**
+ * @name deploy-cv-factory
+ * task to deploy IdleCreditVaultFactory
+ */
+task("deploy-cv-factory", "Deploy IdleCreditVaultFactory")
+  .setAction(async (args) => {
+    // Run compile task
+    await run("compile");
+
+    // Get signer
+    const signer = await helpers.getSigner();
+    const addr = await signer.getAddress();
+
+    console.log(`Deploying IdleCreditVaultFactory with ${addr}`);
+    console.log()
+
+    const networkContracts = getNetworkContracts(hre);
+    const proxyAdmin = networkContracts.proxyAdminWithTimelock || networkContracts.proxyAdmin;
+    console.log(`Using proxy admin at ${proxyAdmin} for IdleCreditVaultFactory deployment`);
+    console.log(`Setting treasury multisig ${networkContracts.treasuryMultisig} as owner of IdleCreditVaultFactory`);
+    const creditVaultFactory = await helpers.deployUpgradableContract(
+      'IdleCreditVaultFactory',
+      [networkContracts.treasuryMultisig, proxyAdmin],
+      signer,
+      proxyAdmin
+    );
+    const implementation = await getImplementationAddress(hre.ethers.provider, creditVaultFactory.address);
+
+    console.log(`IdleCreditVaultFactory proxy deployed at ${creditVaultFactory.address}`);
+    console.log(`IdleCreditVaultFactory implementation deployed at ${implementation}`);
+    console.log(`IdleCreditVaultFactory deployment proxy admin set to ${proxyAdmin}`);
+
+    await run("verify:verify", {
+      constructorArguments: [],
+      address: implementation,
+      contract: "contracts/IdleCreditVaultFactory.sol:IdleCreditVaultFactory"
+    });
+
+    return creditVaultFactory;
+});
+
+/**
+ * @name deploy-keyring-whitelist
+ * task to deploy KeyringIdleWhitelist
+ */
+task("deploy-keyring-whitelist", "Deploy KeyringIdleWhitelist")
+  .addOptionalParam('owner')
+  .setAction(async (args) => {
+    // Run compile task
+    await run("compile");
+
+    // Get signer
+    const signer = await helpers.getSigner();
+    const addr = await signer.getAddress();
+
+    console.log(`Deploying KeyringIdleWhitelist with ${addr}`);
+    console.log()
+
+    const networkContracts = getNetworkContracts(hre);
+    keyringAddress = networkContracts.keyring;
+
+    console.log(`Ownership: ${args.owner}`);
+    console.log(`Keyring address: ${keyringAddress}`);
+    const contract = await helpers.deployContract('KeyringIdleWhitelist', 
+      [keyringAddress, args.owner], 
+      signer
+    );
+
+    // await run("verify:verify", {
+    //   constructorArguments: [keyringAddress, args.owner],
+    //   address: contract.address,
+    //   contract: "contracts/KeyringIdleWhitelist.sol:KeyringIdleWhitelist"
+    // });
+
+    return contract.address;
+});
+
+/**
+ * @name deploy-timelock
+ * task to deploy Timelock
+ */
+task("deploy-timelock", "Deploy Timelock")
+  .addOptionalParam('delay')
+  .setAction(async (args) => {
+    // Run compile task
+    await run("compile");
+
+    // Get signer
+    const signer = await helpers.getSigner();
+    const addr = await signer.getAddress();
+    const networkContracts = getNetworkContracts(hre);
+    const delay = args.delay;
+
+    if (!delay) {
+      console.log("🛑 delay must be specified");
+      return;
+    }
+
+    console.log(`Deploying Timelock (delay ${delay}s) with ${addr}`);
+    console.log()
+    
+    const deployer = networkContracts.deployer;
+    const tlMultisig = networkContracts.treasuryMultisig;
+    const biafAddr = '0xeA173648F959790baea225cE3E75dF8A53a6BDE5';
+    console.log(`Treasury multisig: ${tlMultisig}`);
+
+    const proposers = [deployer, tlMultisig];
+    const executors = [deployer, tlMultisig, biafAddr];
+    const owner = tlMultisig;
+    console.log('Proposers: ', proposers);
+    console.log('Executors: ', executors);
+    console.log('Owner: ', owner);
+
+    const params = [delay, proposers, executors, owner];
+    const contract = await helpers.deployContract('Timelock', params, signer);
+
+    await run("verify:verify", {
+      constructorArguments: params,
+      address: contract.address,
+      contract: "contracts/Timelock.sol:Timelock"
+    });
+});
